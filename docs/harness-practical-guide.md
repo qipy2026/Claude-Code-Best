@@ -12,12 +12,13 @@
 2. [两条运行时路径](#2-两条运行时路径)
 3. [主调用链（REPL）](#3-主调用链repl)
 4. [子系统地图](#4-子系统地图)
-5. [关键契约（改之前必读）](#5-关键契约改之前必读)
-6. [配置型 Harness：settings 与 Hooks](#6-配置型-harnesssettings-与-hooks)
-7. [测试 Harness：怎么验证你的改动](#7-测试-harness怎么验证你的改动)
-8. [实战场景 walkthrough](#8-实战场景-walkthrough)
-9. [调试与排错](#9-调试与排错)
-10. [延伸阅读](#10-延伸阅读)
+5. [Tool Harness 与权限管道（详解）](#5-tool-harness-与权限管道详解)
+6. [关键契约（改之前必读）](#6-关键契约改之前必读)
+7. [配置型 Harness：settings 与 Hooks](#7-配置型-harnessssettings-与-hooks)
+8. [测试 Harness：怎么验证你的改动](#8-测试-harness怎么验证你的改动)
+9. [实战场景 walkthrough](#9-实战场景-walkthrough)
+10. [调试与排错](#10-调试与排错)
+11. [延伸阅读](#11-延伸阅读)
 
 ---
 
@@ -37,6 +38,7 @@
 - **Autonomy harness**：`autonomyRuns` + `autonomyQueueLifecycle` 管理 scheduled/managed flow
 - **Side-channel harness**：`claudeCodeHints` 从 shell 输出里剥 `<claude-code-hint />`
 - **Test harness**：单测/集成测里构造 `ToolUseContext`、mock 依赖（非生产路径）
+- **Tool harness**：工具注册、可见性、执行编排、`canUseTool` 权限管道（见 §5）
 - **Eval harness**：GrowthBook 等通过 env 强制实验分组（`src/services/analytics/growthbook.ts`）
 
 ### 1.2 一句话原则
@@ -122,19 +124,22 @@ sequenceDiagram
 
 ## 4. 子系统地图
 
-### 4.1 权限管道（CanUseTool）
+§4 为索引；**Tool 注册 / 执行 / 权限白名单** 的完整梳理见 **[§5](#5-tool-harness-与权限管道详解)**（初版 §4.1 过简，易误以为 harness 不含权限管理）。
 
-工具执行前不走模型，而走 harness 权限链：
+### 4.1 权限管道（摘要）
+
+工具执行前不走模型，而走 harness 权限链（详见 §5.2–§5.4）：
 
 ```
-tool.call()
-  → canUseTool (REPL: useCanUseTool.tsx / headless: print 注入)
-  → permission rules (settings.json, mode, sandbox)
-  → PermissionRequest / PreToolUse hooks
-  → 用户 UI 或 auto-approve
+tool_use 块完成
+  → StreamingToolExecutor / runTools
+  → canUseTool → hasPermissionsToUseTool
+  → 规则匹配 (allow/deny/ask) + tool.checkPermissions
+  → PermissionRequest / PreToolUse hooks / UI 或 classifier
+  → runToolUse → tool.call()
 ```
 
-改 “为什么这个工具被拦了” → 从 `src/hooks/useCanUseTool.tsx` 和 `src/utils/permissions/` 追。
+改 “为什么这个工具被拦了” → **§5.4** 决策顺序表。
 
 ### 4.2 Hook 执行引擎
 
@@ -187,9 +192,168 @@ Managed flow / HEARTBEAT / cron / proactive tick 会把 prompt **入队**为带 
 
 ---
 
-## 5. 关键契约（改之前必读）
+## 5. Tool Harness 与权限管道（详解）
 
-### 5.1 Deferred autonomy completion
+初版文档把 Tool 层写成「只有 `packages/builtin-tools/` 副作用」，**遗漏了 harness 对工具的注册、可见性、执行编排和权限治理**。下面按代码真实结构梳理。
+
+### 5.1 三层分工
+
+| 层 | 职责 | 关键文件 |
+|----|------|----------|
+| **工具实现** | `call()`、`checkPermissions()`、inputSchema | `packages/builtin-tools/src/tools/*/` |
+| **Tool harness** | 组装工具列表、延迟加载、执行顺序、注入 `canUseTool` | `src/tools.ts`、`src/services/tools/*` |
+| **Permission harness** | 白名单/黑名单/询问规则、模式、classifier、持久化 | `src/utils/permissions/*`、`useCanUseTool.tsx` |
+
+模型只产生 `tool_use`；**能否执行、执行几次、并发与否** 全由 harness 决定。
+
+### 5.2 工具注册与可见性（API 白名单）
+
+```
+src/tools.ts (getTools / 条件加载)
+  → ToolUseContext.options.tools
+  → claude.ts: toolToAPISchema → 发给模型的 tools 数组
+  → query.ts: StreamingToolExecutor / runTools
+```
+
+| 机制 | 作用 |
+|------|------|
+| **`CORE_TOOLS`**（`src/constants/tools.ts`） | 延迟工具（SearchExtraTools）白名单：不在 CORE 的工具可 defer |
+| **`ALL_AGENT_DISALLOWED_TOOLS`** | 子 Agent 禁止携带的工具黑名单 |
+| **`tool.isEnabled()` / feature flag** | 运行时是否注册（如 SleepTool、MonitorTool） |
+| **`allowedTools`（slash 返回）** | 单轮限制可用工具子集 |
+| **MCP 动态工具** | 连接后注入；SearchExtraTools 按需 ExecuteExtraTool |
+
+**注意：** API 里看到的 tools 列表 ≠ 会话里 `options.tools` 全集（延迟工具可能只在 ExecuteExtraTool 路径出现）。
+
+### 5.3 工具执行 Harness（query 内）
+
+```mermaid
+sequenceDiagram
+  participant Q as query.ts
+  participant API as claude.ts
+  participant STE as StreamingToolExecutor
+  participant CUT as canUseTool
+  participant T as tool.call()
+
+  Q->>API: deps.callModel (stream)
+  API-->>Q: assistant + tool_use blocks
+  Q->>STE: addToolUse (流式) 或 runTools (批处理)
+  STE->>CUT: hasPermissionsToUseTool
+  alt allow
+    STE->>T: runToolUse
+    T-->>Q: tool_result message
+  else ask
+    CUT-->>Q: UI / classifier / deny
+  end
+  Q->>API: 下一轮 callModel (带 tool_result)
+```
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| 流式执行 | `StreamingToolExecutor.ts` | 边收 SSE 边排队；并发安全工具可并行 |
+| 批处理 | `toolOrchestration.ts` → `runTools` | 非流式或 fallback 路径 |
+| 单次执行 | `toolExecution.ts` → `runToolUse` | PreToolUse/PostToolUse Hook、实际 `call()` |
+| 权限入口 | `useCanUseTool.tsx` | REPL 注入；headless 由 `print.ts` 注入等价 fn |
+
+### 5.4 权限决策顺序（`hasPermissionsToUseToolInner`）
+
+实现：`src/utils/permissions/permissions.ts`（约 1179 行起）。
+
+| 步骤 | 检查 | 结果 |
+|------|------|------|
+| 1a | 工具级 **deny** 规则 | deny |
+| 1b | 工具级 **ask** 规则 | ask（沙箱 auto-allow bash 可例外） |
+| 1c | **`tool.checkPermissions()`** | 工具自定义（Bash 命令 pattern、路径安全等） |
+| 1d–1g | deny / 强制交互 / 内容 ask / safetyCheck | 即使 bypass 模式也可能 ask |
+| 2a | **`mode === bypassPermissions`**（或 plan+bypass 可用） | allow |
+| 2b | 工具级 **allow** 规则 | allow |
+| 3 | passthrough → **ask** | 弹 UI / classifier |
+| 末尾 | **`dontAsk` 模式** | ask → deny |
+| 末尾 | **`auto` 模式 + classifier** | yoloClassifier 代替人工 |
+
+Hook 层：`PermissionRequest` / `PreToolUse` 在 UI 或 headless 路径上叠加（`executePermissionRequestHooks`、`hooks.ts`）。
+
+### 5.5 「白名单」在代码里是什么
+
+没有单独的 `whitelist.json`；**规则字符串 + 来源（destination）** 构成白名单/黑名单：
+
+```json
+// ~/.claude/settings.json 示例
+{
+  "permissions": {
+    "allow": ["Bash(npm run:*)", "Read(./src/**)"],
+    "deny": ["WebFetch"],
+    "ask": ["Bash(git push:*)"]
+  }
+}
+```
+
+运行时载入为 `ToolPermissionContext`：
+
+| 字段 | 含义 |
+|------|------|
+| `alwaysAllowRules` | allow 规则，按 source 分组 |
+| `alwaysDenyRules` | deny 规则 |
+| `alwaysAskRules` | ask 规则 |
+| `mode` | `default` / `acceptEdits` / `plan` / `bypassPermissions` / `dontAsk` / `auto` |
+| `additionalWorkingDirectories` | 额外可写目录 |
+
+**规则来源（`PermissionRuleSource`）：**
+
+| source | 持久化 | 典型场景 |
+|--------|--------|----------|
+| `userSettings` | 全局磁盘 | `/login`、用户批准「始终允许」 |
+| `projectSettings` | 项目 `.claude/settings.json` | 团队共享 |
+| `localSettings` | gitignore 本地 | 个人项目覆盖 |
+| **`session`** | **仅内存，会话结束失效** | CLI `--permission-mode`、UI「本次会话允许」 |
+| `cliArg` | 启动参数 | `--allowedTools` 等 |
+| `command` / `policySettings` | 只读 | 企业策略、slash 注入 |
+
+用户在权限 UI 选择：
+
+- **`user_permanent`** → 写入 user/project/local settings（持久白名单）
+- **`user_temporary`** → 写入 **`session` destination**（会话级，非 wall-clock TTL）
+- **`user_reject`** → 拒绝本次
+
+见 `PermissionPromptToolResultSchema.ts`、`permissionLogging.ts`。
+
+### 5.6 「时效限制」在代码里是什么
+
+**当前实现没有「规则 N 小时后过期」的 wall-clock TTL 字段**（`permissions/` 下无 `expiresAt`）。
+
+时效由以下机制表达：
+
+| 机制 | 行为 |
+|------|------|
+| **`destination: session`** | 进程/会话存活期间有效，重启 CLI 失效 |
+| **`user_temporary` 批准** | 同上，不写磁盘 |
+| **`user_permanent` 批准** | 持久到 settings，直到用户删除或 `removeRules` |
+| **Auto 模式 classifier** | `DENIAL_LIMITS`：连续 deny ≥3 或累计 ≥20 次后 **fallback 到人工 prompt**（`denialTracking.ts`） |
+| **Plan 模式 / acceptEdits** | 模式切换改变可写路径与 bypass 语义，非时间 TTL |
+| **Sandbox** | 命令在沙箱内执行，与权限规则正交（`shouldUseSandbox`、`SandboxManager`） |
+
+若产品上要「1 小时有效的 allow」，需要新增规则 schema + `permissionsLoader` 过期逻辑（当前未实现）。
+
+### 5.7 与 settings / Hooks 的关系
+
+| 配置 | Tool harness 作用 |
+|------|-------------------|
+| `permissions.allow/deny/ask` | 载入 `ToolPermissionContext` 规则集 |
+| `permissions.defaultMode` | 初始 `mode` |
+| `hooks.PreToolUse` | 可在工具执行前 block / modify |
+| `hooks.PermissionRequest` | 权限对话框前后注入逻辑 |
+
+复杂 allow 仍推荐走 settings + `updateConfig` skill，而非指望模型记忆。
+
+### 5.8 Test-only 与 §6.3 的关系
+
+`allowBackgroundForkedSlashCommands` 属于 **KAIROS 测试逃生口**，与 permissions 白名单无关；详见 [§6.3](#63-test-onlyallowbackgroundforkedslashcommands)。
+
+---
+
+## 6. 关键契约（改之前必读）
+
+### 6.1 Deferred autonomy completion
 
 **问题背景：** KAIROS 等 slash 会 **detach 后台任务** 但立刻从 `processUserInput` 返回。若 harness 马上 `finalizeAutonomyRunCompleted`，调度器会认为 run 已成功，下一 tick 可能叠多个 worker。
 
@@ -209,7 +373,7 @@ Managed flow / HEARTBEAT / cron / proactive tick 会把 prompt **入队**为带 
 - `handlePromptSubmit.ts`
 - `processSlashCommand.test.ts`
 
-### 5.2 Mid-turn queue drain（query.ts）
+### 6.2 Mid-turn queue drain（query.ts）
 
 在 **已有 turn 进行中**，`query.ts` 可能通过 attachment 消费队列里的 autonomy 命令：
 
@@ -225,7 +389,7 @@ const queuedAutonomyClaim = await claimConsumableQueuedAutonomyCommands(...)
 - consumed run → turn 结束时走 `finalizeAutonomyCommandsForTurn`
 - 不要破坏 `markAutonomyRunRunning` 的 **terminal-safe** 转换（`autonomyRuns.test.ts`）
 
-### 5.3 TEST-ONLY：`allowBackgroundForkedSlashCommands`
+### 6.3 TEST-ONLY：`allowBackgroundForkedSlashCommands`
 
 `ToolUseContext.options.allowBackgroundForkedSlashCommands`（`src/Tool.ts`）：
 
@@ -235,13 +399,13 @@ const queuedAutonomyClaim = await claimConsumableQueuedAutonomyCommands(...)
 
 这是 **non-bundled test harness** 进入 KAIROS fork 路径的逃生口，不是功能开关。
 
-### 5.4 Harness-science / Ablation
+### 6.4 Harness-science / Ablation
 
 `src/entrypoints/cli.tsx` 顶部 `ABLATION_BASELINE`：在 **模块 import 前** 注入 env，因为 BashTool/AgentTool 会在 load 时 capture 常量。改 ablation 要放在 cli 入口，不要放到 `init.ts`。
 
 ---
 
-## 6. 配置型 Harness：settings 与 Hooks
+## 7. 配置型 Harness：settings 与 Hooks
 
 用户通过 `~/.claude/settings.json`（及项目级 `settings.local.json`）配置 harness 行为，**无需改 TS**：
 
@@ -258,9 +422,9 @@ Hook 匹配字段（如 `PreToolUse` 的 `tool_name`）见 SDK schema：`src/ent
 
 ---
 
-## 7. 测试 Harness：怎么验证你的改动
+## 8. 测试 Harness：怎么验证你的改动
 
-### 7.1 单元测试（in-process harness）
+### 8.1 单元测试（in-process harness）
 
 **模板：** `src/__tests__/handlePromptSubmit.test.ts`
 
@@ -283,7 +447,7 @@ await handlePromptSubmit({
 - **不要** mock 被测业务模块的上层（避免 `mock.module` 污染同目录其他测试）
 - autonomy 相关：`createAutonomyQueuedPrompt`、`resetCommandQueue`
 
-### 7.2 Slash / deferred completion 测试
+### 8.2 Slash / deferred completion 测试
 
 `src/utils/processUserInput/__tests__/processSlashCommand.test.ts`（若存在）及 `sur-loop-scheduled-oom.md` 中的清单：
 
@@ -291,7 +455,7 @@ await handlePromptSubmit({
 2. 断言 `deferAutonomyCompletion` 时 **handlePromptSubmit 不 finalize**
 3. 后台结束后命令自行 finalize
 
-### 7.3 集成测试（subprocess harness）
+### 8.3 集成测试（subprocess harness）
 
 `tests/integration/autonomy-lifecycle-user-flow.test.ts`：
 
@@ -301,14 +465,14 @@ await handlePromptSubmit({
 
 **何时用集成测：** 跨进程、持久化 autonomy run、真实 CLI argv。
 
-### 7.4 Eval harness（GrowthBook）
+### 8.4 Eval harness（GrowthBook）
 
 `growthbook.ts` 多处注释 **“for eval harnesses”**：
 
 - 环境变量覆盖远程分组，保证 eval **确定性**
 - 写 eval 脚本时优先 env override，而不是改生产默认
 
-### 7.5 测试命令
+### 8.5 测试命令
 
 ```bash
 bun test src/__tests__/handlePromptSubmit.test.ts
@@ -319,7 +483,7 @@ bun run precheck   # 提交前
 
 ---
 
-## 8. 实战场景 walkthrough
+## 9. 实战场景 walkthrough
 
 ### 场景 A：用户提交被 Hook 拦截
 
@@ -359,9 +523,17 @@ bun run precheck   # 提交前
 2. `query.ts` attachment 合并逻辑
 3. 回归：`handlePromptSubmit.test.ts` + 手动 REPL 连发两条消息
 
+### 场景 G：工具被 deny / 白名单不生效
+
+1. 读 `hasPermissionsToUseToolInner` 决策顺序（§5.4）——是 deny 规则、mode、还是 `tool.checkPermissions`
+2. 打印 `appState.toolPermissionContext` 的 `alwaysAllowRules` / `mode`
+3. 确认用户批准写的是 `session` 还是 `userSettings`（§5.5–§5.6）
+4. Bash 类工具跟 `bashPermissions.ts` + `shellRuleMatching.ts`
+5. 单测：`src/utils/permissions/__tests__/` 下对应用例
+
 ---
 
-## 9. 调试与排错
+## 10. 调试与排错
 
 | 目标 | 做法 |
 |------|------|
@@ -370,6 +542,7 @@ bun run precheck   # 提交前
 | 看 Hook 是否执行 | `DEBUG=1` / `logForDebugging`；或 Hook 脚本 stdout |
 | Autonomy 状态 | 日志 + `listAutonomyRuns`；集成测 temp config dir |
 | 排队问题 | `getCommandQueue()` 在测里断言；REPL 看 queue UI |
+| 工具权限 | `hasPermissionsToUseTool` 断点；查 settings `permissions` 与 `mode`（§5） |
 
 **常见误判：**
 
@@ -379,7 +552,7 @@ bun run precheck   # 提交前
 
 ---
 
-## 10. 延伸阅读
+## 11. 延伸阅读
 
 | 文档 | 内容 |
 |------|------|
@@ -392,4 +565,4 @@ bun run precheck   # 提交前
 
 ---
 
-**维护：** 修改 `handlePromptSubmit`、`query.ts` autonomy 消费、`autonomyRuns` 状态机或 Hook 执行语义时，请同步更新本文 §5 契约与 §8 场景。
+**维护：** 修改 `handlePromptSubmit`、`query.ts` autonomy 消费、`autonomyRuns` 状态机、**工具权限/执行管道**或 Hook 执行语义时，请同步更新本文 §5–§6 与 §9 场景。
