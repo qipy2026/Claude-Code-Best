@@ -328,143 +328,254 @@ PromptInput → handlePromptSubmit → executeUserInput → processUserInput
 
 ## 7. L3 上下文与 Prompt Harness
 
-### 7.1 职责
+L3 负责 **上下文资产管理**：计量窗口占用、组装 API payload、以及在超窗时按 deterministic pipeline 丢弃/摘要——**不是**让模型自己决定删什么。
 
-在每次 `callModel` 前组装 **system prompt + messages**，分三条通道：
+> **与 L7 的关系：** §7.4 是完整治理 pipeline（含压缩）；§11 展开各 compressor 函数参数与边界条件。改窗口行为时两层同读。
 
-| 通道 | 函数 | 注入位置 | 内容 |
-|------|------|----------|------|
-| **System prompt** | `getSystemPrompt()` | API `system` | 工具说明、memory 段、MCP、env |
-| **User context** | `getUserContext()` → `prependUserContext()` | messages 头部 meta | CLAUDE.md、日期 |
-| **System context** | `getSystemContext()` → `appendSystemContext()` | system 尾部 | git status |
-| **Turn attachments** | `getAttachmentMessages()` | 每轮 user turn | plan、queue、delta 等 |
+### 7.1 双层视图：Transcript vs API-facing
 
-### 7.2 关键文件
+| 视图 | 存储 | 读者 | 作用 |
+|------|------|------|------|
+| **Full transcript** | REPL `messages`、磁盘 transcript | UI、resume、extractMemories | 用户可见全历史 |
+| **API-facing slice** | 每轮 `messagesForQuery` | `callModel` | 实际进模型窗口 |
 
-| 模块 | 文件 |
-|------|------|
-| 会话 context | `src/context.ts` |
-| 注入 API | `src/utils/api.ts` |
-| CLAUDE.md 发现 | `src/utils/claudemd.ts` |
-| System prompt 段 | `src/constants/prompts.ts` |
-| Turn 级注入 | `src/utils/attachments.ts` |
+每轮 `queryLoop` iteration 入口：
 
-### 7.3 Harness 保证
+```typescript
+// src/query.ts ~522
+let messagesForQuery = getMessagesAfterCompactBoundary(messages)
+```
 
-- `getUserContext` / `getSystemContext`：**lodash memoize**，会话内算一次；`setSystemPromptInjection()` 会 `cache.clear()`
-- `claudeMd` 单独进 `<project-instructions>`，不混在 “may or may not be relevant” disclaimer 里
-- `filterInjectedMemoryFiles` 避免 CLAUDE.md 与 L4 memory 段重复 token
-- `NODE_ENV=test` 时 `prependUserContext` **直接 return 原 messages**——单测不覆盖注入，需集成测
+`getMessagesAfterCompactBoundary`（`src/utils/messages.ts:5057`）从 **最后一个 compact boundary** 起切片；若 `HISTORY_SNIP` 开启，再经 `projectSnippedView` 去掉 snip 登记的 UUID。**UI 保留 full transcript，模型只看 slice。**
 
-### 7.4 CLAUDE.md 开关
+### 7.2 进入窗口的六类 bytes
 
-| 条件 | 行为 |
-|------|------|
+| # | 类别 | 代码入口 | 刷新频率 |
+|---|------|----------|----------|
+| 1 | System prompt | `getSystemPrompt()` + `appendSystemContext` | MCP/工具变 → delta attachment |
+| 2 | User context | `prependUserContext(getUserContext())` | memoize；compact 后清 cache |
+| 3 | Turn attachments | `getAttachmentMessages()` | 每个 user turn |
+| 4 | 对话历史 | boundary slice + §7.4 pipeline | 每个 iteration |
+| 5 | Prefetch 结果 | memory/skill prefetch await 后注入 | 每个 user turn |
+| 6 | Tools schema | `toolToAPISchema` | defer/MCP 变 → delta |
+
+**静态注入**（`src/utils/api.ts:443`）：`claudeMd` → `<project-instructions>`；其余 context → `<system-reminder>` meta。**`NODE_ENV=test` 时 prepend 直接 return**——单测不测注入，用集成测或 dev 手动验证。
+
+### 7.3 Token 账本：如何判定「快满了」
+
+**计量函数：** `tokenCountWithEstimation(messages)` — `src/utils/tokens.ts:251`
+
+逻辑摘要：
+
+1. 从尾部找最近带 API `usage` 的 assistant
+2. 同一 response 拆多条 assistant 时 **walk back 相同 `message.id`**（否则漏计 interleaved tool_result）
+3. `usage 总量 + roughTokenCountEstimation(usage 之后的新消息)`
+
+**有效窗口上限：**
+
+```typescript
+// src/services/compact/autoCompact.ts:33
+getEffectiveContextWindowSize(model)
+  = getContextWindowForModel(model) - min(maxOutput, 20_000)
+  // 可被 CLAUDE_CODE_AUTO_COMPACT_WINDOW cap
+```
+
+**Autocompact 触发线：**
+
+```typescript
+// autoCompact.ts:101
+getAutoCompactThreshold(model)
+  = getEffectiveContextWindowSize(model) - getAutocompactBufferTokens(model)
+  // buffer: 13k / 30k / 50k（按窗口大小）
+```
+
+**硬阻断**（auto-compact 关闭时，`query.ts:820`）：`calculateTokenWarningState` → `isAtBlockingLimit` → yield `PROMPT_TOO_LONG_ERROR_MESSAGE`，`return { reason: 'blocking_limit' }`。
+
+**调试 env：** `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`、`DISABLE_AUTO_COMPACT`、`CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE`。日志：`autocompact: tokens=… threshold=… snipFreed=…`（`shouldAutoCompact`）。
+
+### 7.4 窗口治理 Pipeline（`query.ts` 522–650，不可乱序）
+
+```
+getMessagesAfterCompactBoundary
+  → 删除 stale toolUseResult（RSS，~530）
+  → applyToolResultBudget          // toolResultStorage.ts:925
+  → snipCompactIfNeeded            // snipTokensFreed → autocompact
+  → microcompact
+  → contextCollapse?（先于 autocompact）
+  → autocompact（先 trySessionMemoryCompaction）
+  → blocking_limit 检查（~820，compact 刚发生则 skip）
+  → prependUserContext + callModel
+```
+
+#### 各阶段：丢什么、留什么、如何补回
+
+| 阶段 | 代码 | 丢失/替换 | 保留/恢复 |
+|------|------|-----------|-----------|
+| toolUseResult 删对象 | `query.ts:530` | 内存 raw output | API `tool_result` block 仍在 |
+| tool result budget | `applyToolResultBudget` | 超大 result → stub 字符串 | transcript `ContentReplacementRecord` 可 resume |
+| snip | `snipCompact.ts` | `removedUuids` 消息 | boundary 记录；文件/plan 应已外化 |
+| microcompact | `microCompact.ts` | 旧 Read/Bash/Grep… **内容** → cleared 文案 | 最近 5 个 tool（cached MC `keepRecent`）；磁盘文件可再 Read |
+| session-memory compact | `sessionMemoryCompact.ts` | prune 老 messages | `session-memory/summary.md` + ≥5 text messages |
+| full autocompact | `compactConversation` | **全部** pre-boundary 对话 | **summary** + post-compact attachments（§7.5） |
+| blocking | `query.ts:824` | 拒绝 API | 用户手动 `/compact` |
+
+**snip 与阈值：** snip 后 surviving assistant 的 `usage` 仍反映 pre-snip 大小，故：
+
+```typescript
+// autoCompact.ts:254
+const tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed
+```
+
+**microcompact 白名单**（`microCompact.ts:41`）：Read、Shell、Grep、Glob、WebSearch、WebFetch、Edit、Write——Agent/MCP 不在内。
+
+### 7.5 Compact 后「有用信息」恢复包
+
+Full compact **无 `messagesToKeep`**（与 partial compact 不同）。靠 summary + 刻意 re-inject：
+
+```typescript
+// compact.ts:336 — 顺序固定
+buildPostCompactMessages: boundary → summary → messagesToKeep? → attachments → hooks
+```
+
+`compactConversation` 成功后主动恢复（`compact.ts` 541–612）：
+
+| 恢复项 | 函数 |
+|--------|------|
+| 最近读过文件 | `createPostCompactFileAttachments`（有上限） |
+| 当前 plan | `createPlanAttachmentIfNeeded` |
+| Plan mode | `createPlanModeAttachmentIfNeeded` |
+| 已用 skill | `createSkillAttachmentIfNeeded` |
+| 工具/Agent/MCP delta | `getDeferredToolsDeltaAttachment` 等（对空 history 全量 re-announce） |
+| CLAUDE.md 刷新 | `runPostCompactCleanup` → `getUserContext.cache.clear()` |
+| 磁盘 transcript | **不删**；仅 API slice 变短 |
+
+Summary 由 `runForkedAgent` + `getCompactPrompt` 生成；compact 请求 PTL 时 `truncateHeadForPTLRetry`（CC-1180）。
+
+### 7.6 CLAUDE.md 与静态 context
+
+`getUserContext`（`context.ts:155`）→ `getClaudeMds(filterInjectedMemoryFiles(await getMemoryFiles()))`。
+
+| env | 行为 |
+|-----|------|
 | `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` | 硬关 |
-| `--bare` 且无 `--add-dir` | 跳过自动 walk |
+| `--bare` 且无 `--add-dir` | 跳过 walk |
 | `--add-dir` | 显式目录仍加载 |
 
-### 7.5 Attachment 时机分类
+用户查看当前 API 视图：`/context` → `getMessagesAfterCompactBoundary(messages)`（`commands/context/context.tsx`）。
 
-| 类型 | 时机 | 示例 |
-|------|------|------|
-| Session 级 | memoize | CLAUDE.md、git |
-| Turn 级 | 每次 user input | plan mode、autonomy queue |
-| Async prefetch | turn 开始 fire-and-forget | relevant memory（§8.4）、skill discovery |
+### 7.7 典型案例（代码入口）
 
-### 7.6 实战
+→ 逐步操作见 [§21.4](#214-l3-上下文与-prompt)
 
-「CLAUDE.md 改了但模型还用旧的」→ 查 memoize 是否被 `postCompactCleanup` 清掉，不是模型问题。
-
-### 7.7 典型案例
-
-→ [§21.4 L3 案例](#214-l3-上下文与-prompt)
-
-| 案例 | 一句话 |
-|------|--------|
-| [L3-1](#案例-l3-1-claudemd-修改不生效) | memoize 未 invalidate |
-| [L3-2](#案例-l3-2-plan-mode-切换后模型仍像在执行模式) | plan attachment 未注入 |
-| [L3-3](#案例-l3-3-mcp-重连后工具说明重复或缺失) | `mcp_instructions_delta` |
-| [L3-4](#案例-l3-4-bare-模式仍加载了部分-claudemd) | `--add-dir` 显式路径 |
+| 案例 | 先读哪里 |
+|------|----------|
+| [L3-1](#案例-l3-1-claudemd-修改不生效) | `postCompactCleanup.ts` |
+| [L3-5](#案例-l3-5-如何读当前-token-占用) | `tokenCountWithEstimation` |
+| [L3-6](#案例-l3-6-compact-后-plan-丢失) | `createPlanAttachmentIfNeeded` |
+| [L7-1](#案例-l7-1-对话中途突然变摘要) | `shouldAutoCompact` |
 
 ---
 
 ## 8. L4 记忆 Harness
 
-### 8.1 职责
+L4 是 **跨会话 + 会话内** 的知识外化层，与 L3 窗口治理分工：
 
-三条**独立**路径，勿混为一谈：
-
-| 路径 | 生命周期 | 机制 |
-|------|----------|------|
-| **持久 memdir** | 跨会话 | `MEMORY.md` + sidecar 文件 |
-| **Turn 结束提取** | 异步后台 | `extractMemories` |
-| **Turn 内 recall** | 当前 turn | prefetch + `nested_memory` |
-| **Session-memory** | 当前 session | compact 摘要、plan spill |
-
-### 8.2 开关链（`src/memdir/paths.ts`）
-
-`isAutoMemoryEnabled()` 优先级：
-
-1. `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` → OFF
-2. `CLAUDE_CODE_SIMPLE` / `--bare` → OFF
-3. CCR 且无 `CLAUDE_CODE_REMOTE_MEMORY_DIR` → OFF
-4. `settings.autoMemoryEnabled`
-5. 默认 ON
-
-`ensureMemoryDirExists()` — **Harness guarantees the directory exists**。
-
-### 8.3 System prompt 注入
-
-```
-getSystemPrompt() → loadMemoryPrompt()
-  → buildMemoryPrompt → MEMORY.md (≤200 行 & ≤25KB 截断)
-```
-
-### 8.4 Turn 内 Prefetch
-
-```ts
-// query.ts — 每 user turn 一次
-using pendingMemoryPrefetch = startRelevantMemoryPrefetch(messages, toolUseContext)
-```
-
-- `findRelevantMemories`：Sonnet side-query，最多 5 文件
-- Poor mode / 单词 prompt / `MAX_SESSION_BYTES` 跳过
-- `using` dispose → abort + `tengu_memdir_prefetch_collected`
-
-### 8.5 Turn 结束 extractMemories
-
-触发：`stopHooks.ts` → `handleStopHooks`（模型无 pending tool）
-
-条件：`feature('EXTRACT_MEMORIES')` && 主线程 && `isExtractModeActive()` && !bare && !poor && `isAutoMemoryEnabled()`
-
-实现：`runForkedAgent` 写 memdir；与主 agent 手写 memory 去重（`hasMemoryWritesSince`）。
-
-Headless `-p`：`print.ts` → `drainPendingExtraction` 再 shutdown。
-
-### 8.6 Session-memory 路径
-
-| 路径 | 用途 |
+| 问题 | 谁管 |
 |------|------|
-| `{projectDir}/{sessionId}/session-memory/` | 会话摘要 |
-| `plans/`、`tool-results/` | plan harness、大结果 spill |
+| 单 session 内 token 超限 | L3/L7 compact、session-memory |
+| 跨 session 记住偏好/架构 | L4 memdir |
+| 本轮可能需要某条 memory | L4 prefetch |
 
-`filesystem.ts` 步骤 7：`checkReadableInternalPath` 允许 Read harness 路径。
+### 8.1 四条路径（勿混）
 
-### 8.7 实战
+| 路径 | 生命周期 | 代码 | 进窗口方式 |
+|------|----------|------|------------|
+| **MEMORY.md 索引** | 跨 session | `loadMemoryPrompt()` → `buildMemoryPrompt` | system prompt 段 |
+| **Sidecar `.md`** | 跨 session | memdir 文件 | prefetch attachment（≤5 文件/turn） |
+| **extractMemories** | turn 结束异步 | `extractMemories.ts` + `stopHooks.ts` | 写磁盘，下轮 prefetch/索引 |
+| **session-memory** | 当前 session | `sessionMemoryCompact.ts` | compact 时 summary.md；L3 恢复 |
 
-「没生成 memory 文件」→ 查 feature + poor + bare + 非交互 gate，不是模型「不想记」。
+### 8.2 开关与路径（代码级）
 
-### 8.8 典型案例
+```typescript
+// src/memdir/paths.ts — isAutoMemoryEnabled() 顺序：
+// CLAUDE_CODE_DISABLE_AUTO_MEMORY → SIMPLE/bare → CCR 无 REMOTE_MEMORY_DIR
+// → settings.autoMemoryEnabled → default true
+
+getAutoMemPath()  // ~/.claude/projects/<encoded-path>/memory/
+ensureMemoryDirExists(memoryDir)  // memdir.ts:129 — harness 保证目录存在
+```
+
+### 8.3 MEMORY.md 注入与截断
+
+```typescript
+// prompts.ts → systemPromptSection('memory', () => loadMemoryPrompt())
+// memdir.ts — truncateEntrypointContent:
+//   MAX_ENTRYPOINT_LINES = 200, MAX_ENTRYPOINT_BYTES = 25_000
+```
+
+超长 index **故意截断**——细节应放 sidecar 文件，由 prefetch 按 query 拉入（避免撑爆 system prompt）。
+
+### 8.4 Turn 内 Prefetch（代码路径）
+
+```typescript
+// query.ts ~453 — 每 user turn 一次，using 保证 dispose
+using pendingMemoryPrefetch = startRelevantMemoryPrefetch(state.messages, state.toolUseContext)
+```
+
+`startRelevantMemoryPrefetch`（`attachments.ts:2419`）gate 链：
+
+1. `isAutoMemoryEnabled()` && GrowthBook `tengu_moth_copse`
+2. `!isPoorModeActive()`
+3. 最后 user 消息含空格（单词 prompt 跳过）
+4. `collectSurfacedMemories(messages).totalBytes < MAX_SESSION_BYTES`（60KB，`attachments.ts:282`）
+
+`findRelevantMemories`（`memdir/findRelevantMemories.ts:40`）：`scanMemoryFiles` → Sonnet side-query → 最多 **5** 文件；排除 `alreadySurfaced`；单文件 injection cap `MAX_MEMORY_BYTES = 4096`。
+
+### 8.5 extractMemories（代码路径）
+
+触发：`src/query/stopHooks.ts` — 模型 **无 pending tool** 的 turn 结束。
+
+```typescript
+if (
+  feature('EXTRACT_MEMORIES') &&
+  !toolUseContext.agentId &&
+  isExtractModeActive() &&
+  !poorMode
+) {
+  void import('.../extractMemories.js')
+    .then(({ executeExtractMemories }) => executeExtractMemories(...))
+}
+```
+
+实现要点（`extractMemories.ts`）：
+
+- `runForkedAgent` 读 **model-visible** messages（排除 progress/system/attachment）
+- 仅允许写 `isAutoMemPath(file_path)` 的 Edit/Write；只读 Bash 白名单
+- `hasMemoryWritesSince`：主 agent 本轮已写 memory → background **跳过**重叠区间
+
+Headless：`print.ts` → `drainPendingExtraction()` 再 shutdown。
+
+### 8.6 session-memory 与 L3 compact 交界
+
+`trySessionMemoryCompaction`（`autoCompact.ts:317`）在 full autocompact **之前**尝试：把对话沉淀到 `{projectDir}/{sessionId}/session-memory/summary.md`，再 prune messages（保留 `minTextBlockMessages: 5`、`minTokens: 10_000` 等，见 `DEFAULT_SM_COMPACT_CONFIG`）。
+
+`filesystem.ts:1153` — `checkReadableInternalPath` 允许 Read harness 路径（session-memory、plans、tool-results）。
+
+### 8.7 与 L3 去重
+
+`filterInjectedMemoryFiles`（claudemd）：已在 system prompt memory 段出现的文件 **不再**进 `getUserContext` 的 CLAUDE.md 聚合，防 double token。
+
+### 8.8 典型案例（代码入口）
 
 → [§21.5 L4 案例](#215-l4-记忆)
 
-| 案例 | 一句话 |
-|------|--------|
-| [L4-1](#案例-l4-1-长对话后-memdir-无新文件) | extractMemories gate 未过 |
-| [L4-2](#案例-l4-2-pipe-模式记忆未落盘) | 未 `drainPendingExtraction` |
-| [L4-3](#案例-l4-3-prefetch-没注入相关记忆) | GrowthBook / 单词 prompt / 字节上限 |
-| [L4-4](#案例-l4-4-memorymd-被截断模型看不到后半) | 200 行 / 25KB cap |
+| 案例 | 先读哪里 |
+|------|----------|
+| [L4-1](#案例-l4-1-长对话后-memdir-无新文件) | `stopHooks.ts` extract 条件 |
+| [L4-2](#案例-l4-2-pipe-模式记忆未落盘) | `print.ts` drainPendingExtraction |
+| [L4-3](#案例-l4-3-prefetch-没注入相关记忆) | `startRelevantMemoryPrefetch` gate |
+| [L4-5](#案例-l4-5-主-agent-写了-memory-extract-仍重复写) | `hasMemoryWritesSince` |
 
 ---
 
@@ -559,42 +670,60 @@ F5 断点：`query.ts` 的 `queryLoop`；API 单次请求断 `claude.ts` 的 `qu
 
 ## 11. L7 上下文窗口 Harness（压缩）
 
-### 11.1 职责
+§7.4 的 pipeline 实现层。改 compressor 时对照本表 + `query.ts` 调用顺序。
 
-Token 逼近上限时 **确定性瘦身**——模型不能自己删历史。
+### 11.1 阈值公式（必读）
 
-### 11.2 压缩链（每次 iteration、callModel 前）
+```typescript
+// autoCompact.ts
+effectiveWindow = getContextWindowForModel(model) - min(maxOutput, 20_000)
+autoCompactAt   = effectiveWindow - getAutocompactBufferTokens(model)  // 13k/30k/50k
+blockingAt      = effectiveWindow - 3_000  // MANUAL_COMPACT_BUFFER_TOKENS，autocompact 关时
+shouldCompact   = tokenCountWithEstimation(msgs) - snipTokensFreed >= autoCompactAt
+```
 
-| 顺序 | 模块 | Feature | 作用 |
-|------|------|---------|------|
-| 1 | `snipCompactIfNeeded` | `HISTORY_SNIP` | 截断远端历史；`snipTokensFreed` 参与阈值 |
-| 2 | `microcompact` | 始终 | 清大 tool_result / cache edit |
-| 3 | `applyCollapsesIfNeeded` | `CONTEXT_COLLAPSE`（默认关） | 读时投影，**先于** autocompact |
-| 4 | `autocompact` | 始终 | 超阈 fork 摘要 |
+熔断：`consecutiveFailures >= 3` → `autoCompactIfNeeded` 直接 return（`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES`）。
 
-阈值：`getEffectiveContextWindowSize(model)` = 窗口 − summary 预留（~20k）；buffer 按窗口阶梯 13k / 30k / 50k。
+### 11.2 各 compressor 实现要点
 
-### 11.3 Harness 保证
+| 函数 | 文件 | 输入→输出 | 关键常量/逻辑 |
+|------|------|-----------|---------------|
+| `applyToolResultBudget` | `toolResultStorage.ts:925` | 超大 tool_result → stub | `contentReplacementState`；resume 从 transcript record 重建 |
+| `snipCompactIfNeeded` | `snipCompact.ts` | 按 boundary UUID 删 messages | 返回 `{ messages, tokensFreed, boundaryMessage }` |
+| `microcompactMessages` | `microCompact.ts:257` | 清 COMPACTABLE_TOOLS 旧内容 | cached MC: `triggerThreshold` + `keepRecent: 5` |
+| `trySessionMemoryCompaction` | `sessionMemoryCompact.ts` | prune + summary.md | `minTokens: 10_000`, `minTextBlockMessages: 5`, `maxTokens: 40_000` |
+| `compactConversation` | `compact.ts:411` | 全量 fork 摘要 | 无 messagesToKeep；PTL → `truncateHeadForPTLRetry` |
+| `partialCompactConversation` | `compact.ts:801` | 保留 pivot 前/后 | `messagesToKeep` 显式 slice |
+| `runPostCompactCleanup` | `postCompactCleanup.ts:43` | 清 module caches | 主线程才清 `getUserContext.cache`（subagent 不能清） |
 
-- 压缩成功 → `buildPostCompactMessages` 替换 `messagesForQuery`，yield boundary 给 UI
-- `consecutiveFailures` 熔断不可恢复超限
-- compact 后 → `postCompactCleanup` 清 `getUserContext` cache
-- `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 可人为缩小触发窗口
+### 11.3 autocompact 调用顺序（`autoCompact.ts:270`）
 
-### 11.4 实战
+1. `shouldAutoCompact` — 排除 `querySource === 'session_memory' | 'compact' | 'marble_origami'`
+2. **`trySessionMemoryCompaction` 优先** — 成功则 skip full compact
+3. `compactConversation(..., isAutoCompact: true)`
+4. `runPostCompactCleanup(querySource)`
 
-跟 checkpoint：`query_snip_*` → `query_microcompact_*` → `query_autocompact_*` + `tengu_auto_compact_succeeded`。
+### 11.4 调试 checklist
+
+```bash
+# 1. 开 debug 看阈值日志
+DEBUG=1 bun run dev
+# 搜：autocompact: tokens= threshold= snipFreed=
+
+# 2. 人为提前触发（开发）
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50 bun run dev
+
+# 3. 断点（F5 同进程 dev-cli）
+# query.ts: query_snip_start / query_microcompact_start / query_autocompact_start
+# autoCompact.ts: shouldAutoCompact return 行
+# compact.ts: compactConversation 入口
+```
+
+Telemetry：`tengu_auto_compact_succeeded`、`tengu_compact`（含 `truePostCompactTokenCount`、`willRetriggerNextTurn`）。
 
 ### 11.5 典型案例
 
-→ [§21.8 L7 案例](#218-l7-上下文窗口压缩)
-
-| 案例 | 一句话 |
-|------|--------|
-| [L7-1](#案例-l7-1-对话中途突然变摘要) | autocompact 触阈 |
-| [L7-2](#案例-l7-2-compact-后-claudemd-仍是旧的) | postCompactCleanup 未清 cache |
-| [L7-3](#案例-l7-3-snip-后仍立即-autocompact) | `snipTokensFreed` 未参与阈值 |
-| [L7-4](#案例-l7-4-手动-compact-与自动-compact-行为不同) | buffer 常量差异 |
+→ [§21.8](#218-l7-上下文窗口压缩)（含逐步代码操作）
 
 ---
 
@@ -1031,43 +1160,95 @@ bun run precheck
 
 #### 案例 L3-1：CLAUDE.md 修改不生效
 
-| 项 | 内容 |
-|----|------|
-| **现象** | 磁盘已改 CLAUDE.md，模型仍按旧规则答 |
-| **触发** | `getUserContext` memoize 未清；或未走 compact 后 cleanup |
-| **Harness** | 会话内 cache；compact 后 `postCompactCleanup` 应 `getUserContext.cache.clear()` |
-| **排查** | 是否同 session 未重启；改 md 后是否触发 compact；`CLAUDE_CODE_DISABLE_CLAUDE_MDS` |
-| **验证** | 新开会话对比；或手动触发 compact 后再问 |
+**现象：** 已保存 `CLAUDE.md`，模型仍引用旧规则。
 
-#### 案例 L3-2：Plan mode 切换后模型仍像执行模式
+**代码根因：** `getUserContext` 是 memoize（`context.ts:155`）；compact 后应经 `runPostCompactCleanup` 清 cache（`postCompactCleanup.ts:64` 起 `getUserContext.cache.clear?.()`），且 **仅 main-thread compact** 才清（subagent compact 不能清，见 `isMainThreadCompact`）。
 
-| 项 | 内容 |
-|----|------|
-| **现象** | 进入 plan mode 后模型直接改文件 |
-| **触发** | `getPlanModeAttachments` 未注入或 mode 未同步 AppState |
-| **Harness** | turn 级 attachment + permission mode `plan` |
-| **排查** | `appState.toolPermissionContext.mode`；messages 里是否有 plan attachment |
-| **验证** | EnterPlanMode 后断言 Write 被 plan harness 限制 |
+**操作步骤：**
 
-#### 案例 L3-3：MCP 重连后工具说明重复或缺失
+1. REPL 输入 `/context`，确认是否有 `<project-instructions>` 块及内容版本
+2. 断点：`context.ts` `getUserContext` 内 `getClaudeMds` 返回处——若未命中说明 cache 未失效
+3. 强制失效路径（任选）：
+   - 触发 compact → 观察 `runPostCompactCleanup` 是否执行
+   - 或新开会话（新进程必刷新）
+4. 确认未设 `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`
 
-| 项 | 内容 |
-|----|------|
-| **现象** | MCP server 重启后 system 里指令重复，或新工具无说明 |
-| **触发** | delta attachment 与全量 section 同时生效或 delta 未触发 |
-| **Harness** | `mcp_instructions_delta` attachment（feature 开时替代全量段） |
-| **排查** | `isMcpInstructionsDeltaEnabled()`；`getMcpInstructionsDeltaAttachment` |
-| **验证** | 重连 MCP 前后抓 API 请求 system 段 diff |
+**改代码后回归：** compact 路径必须调用 `runPostCompactCleanup(querySource)` 且 `querySource.startsWith('repl_main_thread')`。
 
-#### 案例 L3-4：`--bare` 模式仍加载了部分 CLAUDE.md
+---
 
-| 项 | 内容 |
-|----|------|
-| **现象** | `CLAUDE_CODE_SIMPLE=1` 但 project-instructions 仍有内容 |
-| **触发** | 使用了 `--add-dir`，bare 仍 honor 显式目录 |
-| **Harness** | bare = 跳过自动 walk，非忽略用户显式指定 |
-| **排查** | `getAdditionalDirectoriesForClaudeMd()`；context.ts `shouldDisableClaudeMd` 逻辑 |
-| **验证** | bare 无 add-dir vs 有 add-dir 对比 token |
+#### 案例 L3-2：Plan mode 下仍 Write 文件
+
+**现象：** 已进入 plan，模型仍执行 Edit/Write。
+
+**代码路径：**
+
+1. `appState.toolPermissionContext.mode === 'plan'` — `EnterPlanModeTool` 设置
+2. turn attachment：`getPlanModeAttachments` in `attachments.ts`（随 `getAttachmentMessages` 注入）
+3. 写权限：`filesystem.ts` plan 模式对 Write 的约束
+
+**操作步骤：**
+
+1. 断点 `processUserInput` 返回后，查 messages 末尾是否有 plan attachment meta
+2. 断点 `hasPermissionsToUseToolInner`，确认 `mode === 'plan'` 时 Write 走 deny/ask
+3. 若 attachment 有但 permission 无约束 → 查 plan mode 与 permission 是否同步（REPL state update）
+
+---
+
+#### 案例 L3-5：如何读当前 token 占用
+
+**目的：** 确认距离 autocompact 还有多远。
+
+**代码入口：**
+
+```typescript
+// 与 autocompact 决策同一函数
+import { tokenCountWithEstimation } from 'src/utils/tokens.ts'
+import {
+  calculateTokenWarningState,
+  getAutoCompactThreshold,
+  getEffectiveContextWindowSize,
+} from 'src/services/compact/autoCompact.ts'
+
+const model = toolUseContext.options.mainLoopModel
+const msgs = getMessagesAfterCompactBoundary(appState.messages)
+const used = tokenCountWithEstimation(msgs)
+const state = calculateTokenWarningState(used, model)
+// state.isAboveAutoCompactThreshold / isAtBlockingLimit / percentLeft
+```
+
+**REPL 内：** 底部 `TokenWarning` 组件（`components/TokenWarning.tsx`）读同一套 state。
+
+**开发：** `DEBUG=1` 搜日志 `autocompact: tokens=`（`shouldAutoCompact`）。
+
+---
+
+#### 案例 L3-6：compact 后 plan 丢失
+
+**现象：** autocompact 后模型「忘记」当前 plan，开始乱改。
+
+**代码根因：** full compact 会清空 boundary 前所有 messages；plan 靠 **post-compact attachment** 恢复，不是保留在 history 里。
+
+**恢复链（`compact.ts` 572–575）：**
+
+```typescript
+const planAttachment = createPlanAttachmentIfNeeded(context.agentId)
+if (planAttachment) postCompactFileAttachments.push(planAttachment)
+```
+
+**操作步骤：**
+
+1. compact 前确认 plan 文件存在：`getPlanFilePath` / `plans/` 目录
+2. compact 后断点 `buildPostCompactMessages`，检查 `result.attachments` 是否含 plan attachment
+3. 若缺失：查 `createPlanAttachmentIfNeeded` 返回 null 的条件（无 active plan / agentId 路径）
+
+**修复方向：** 确保 plan 持久化在 harness 路径（`plans/`），而非只存在于被摘要掉的 messages 里。
+
+---
+
+#### 案例 L3-3 / L3-4
+
+见上表；MCP delta 断点 `getMcpInstructionsDeltaAttachment`（`attachments.ts`）；bare 模式读 `context.ts:165` `shouldDisableClaudeMd`。
 
 ---
 
@@ -1075,43 +1256,91 @@ bun run precheck
 
 #### 案例 L4-1：长对话后 memdir 无新文件
 
-| 项 | 内容 |
-|----|------|
-| **现象** | 多 turn 后 `~/.claude/projects/.../memory/` 无变化 |
-| **触发** | extractMemories gate：feature / poor / bare / 非交互 / subagent |
-| **Harness** | turn 结束 `handleStopHooks` fire-and-forget fork |
-| **排查** | `isAutoMemoryEnabled()`、`isExtractModeActive()`、`/poor`、主线程 `!agentId` |
-| **验证** | 交互 REPL 完成一轮无 tool 的 turn；查 stopHooks 是否跑到 import |
+**代码 gate 链（必须全部满足，`stopHooks.ts:145-163`）：**
+
+```typescript
+feature('EXTRACT_MEMORIES')
+&& !toolUseContext.agentId
+&& isExtractModeActive()   // paths.ts:69 — GrowthBook + 交互/非交互
+&& !isBareMode() && !poorMode
+&& isAutoMemoryEnabled()   // paths.ts:30
+```
+
+**操作步骤：**
+
+1. 确认 turn 已 **结束且无 pending tool**（extract 在 stopHooks，不在 tool loop 中间）
+2. 断点 `stopHooks.ts` import `extractMemories` 行
+3. 查 `isExtractModeActive()`：`getFeatureValue_CACHED_MAY_BE_STALE('tengu_passport_quail')` 等
+4. 查 memdir：`getAutoMemPath()` 输出路径，列目录 mtime
+
+**常见误杀：** `/poor`、`-p` 非交互且 slate thimble gate 关、subagent turn。
+
+---
 
 #### 案例 L4-2：pipe 模式记忆未落盘
 
-| 项 | 内容 |
-|----|------|
-| **现象** | `echo "..." \| bun run dev -p` 结束后 memdir 无写入 |
-| **触发** | 进程 exit 早于 `drainPendingExtraction` |
-| **Harness** | `print.ts` shutdown 前应等待 in-flight extract |
-| **排查** | headless 退出路径；extract promise 是否被 void 掉 |
-| **验证** | 加长 pipe 对话 + 退出前 sleep；或查 print.ts drain 逻辑 |
+**代码路径：** extract 是 fire-and-forget `void import(...).then(executeExtractMemories)`；进程 exit 必须等 promise。
+
+**操作步骤：**
+
+1. 读 `src/cli/print.ts` 搜 `drainPendingExtraction`
+2. 复现：`echo "remember X" | bun run dev -p`，在 exit 前加断点看 extract promise 状态
+3. 若改 shutdown 路径：确保 `gracefulShutdown` 调用 drain
+
+---
 
 #### 案例 L4-3：prefetch 没注入相关记忆
 
-| 项 | 内容 |
-|----|------|
-| **现象** | memdir 有明显相关文件，本轮模型未收到 |
-| **触发** | 单词 prompt、Poor mode、GrowthBook gate、`MAX_SESSION_BYTES` 已满 |
-| **Harness** | `startRelevantMemoryPrefetch` + side-query 选最多 5 个 |
-| **排查** | telemetry `tengu_memdir_prefetch_collected`；`alreadySurfaced` 集合 |
-| **验证** | 多词具体问题复现；查 `findRelevantMemories` 返回 |
+**gate 代码（`attachments.ts:2419-2450`）：**
 
-#### 案例 L4-4：MEMORY.md 被截断，模型看不到后半
+```typescript
+if (!isAutoMemoryEnabled()) return undefined
+if (!getFeatureValue_CACHED_MAY_BE_STALE('tengu_moth_copse', false)) return undefined
+if (isPoorModeActive()) return undefined
+const input = getUserMessageText(lastUserMessage)
+if (!input || !/\s/.test(input.trim())) return undefined  // 单词跳过
+if (collectSurfacedMemories(messages).totalBytes >= 60 * 1024) return undefined
+```
 
-| 项 | 内容 |
-|----|------|
-| **现象** | 索引很大但 system prompt 里 MEMORY.md 只有前 200 行 |
-| **触发** | `truncateEntrypointContent` 行/字节双 cap |
-| **Harness** | 防止 entrypoint 撑爆 context；sidecar 文件靠 prefetch 拉 |
-| **排查** | `tengu_memdir_*` telemetry `was_truncated`；拆分到 sidecar md |
-| **验证** | 缩小 MEMORY.md；靠 L4-3 prefetch 补全细节 |
+**操作步骤：**
+
+1. 用 **多词** user prompt 复现（非单词）
+2. 断点 `findRelevantMemories` → 看 `scanMemoryFiles` 列表与 Sonnet 选中 filenames
+3. 查 telemetry `tengu_memdir_prefetch_collected`（`attachments.ts:2478`）
+4. 确认 sidecar 文件不在 `alreadySurfaced`（本轮/session 已注入过）
+
+**设计意图：** 单文件 injection ≤ `MAX_MEMORY_BYTES = 4096`（`attachments.ts:280`）；session 累计 ≤ 60KB。
+
+---
+
+#### 案例 L4-4：MEMORY.md 截断
+
+**代码：**
+
+```typescript
+// memdir.ts
+MAX_ENTRYPOINT_LINES = 200
+MAX_ENTRYPOINT_BYTES = 25_000
+truncateEntrypointContent(raw)  // buildMemoryPrompt 与 getMemoryFiles 共用
+```
+
+**正确用法：** 大段知识放 `memory/foo-bar.md` sidecar；`MEMORY.md` 只做索引。细节靠 L4-3 prefetch 按 query 拉入。
+
+**验证：** 改 MEMORY.md 超过 200 行 → system prompt 中应见 truncation warning 行；telemetry `was_truncated: true`。
+
+---
+
+#### 案例 L4-5：主 agent 写了 memory，extract 仍重复写
+
+**代码：** `extractMemories.ts` 内 `hasMemoryWritesSince` — 主 agent 本轮已 Edit/Write 到 `isAutoMemPath` → background agent 跳过该 transcript 区间。
+
+**操作步骤：**
+
+1. 主 thread 用 Write 写 `getAutoMemPath()` 下文件
+2. turn 结束触发 extract
+3. 断点 extract fork 内，确认 skip 逻辑命中
+
+**若重复写：** 检查 `isAutoMemPath` 是否匹配实际路径；或主 agent 写 memory 用的路径不在 auto mem dir。
 
 ---
 
@@ -1207,43 +1436,87 @@ bun run precheck
 
 #### 案例 L7-1：对话中途突然变摘要
 
-| 项 | 内容 |
-|----|------|
-| **现象** | UI 出现 compact boundary，早期消息被 summary 替代 |
-| **触发** | token 超 `getEffectiveContextWindowSize - buffer` |
-| **Harness** | autocompact fork 摘要 |
-| **排查** | `tengu_auto_compact_succeeded`；`CLAUDE_CODE_AUTO_COMPACT_WINDOW` |
-| **验证** | 故意读大文件灌 token；跟 checkpoint 链 |
+**触发公式：**
+
+```typescript
+// autoCompact.ts:254-267
+tokenCountWithEstimation(messages) - snipTokensFreed >= getAutoCompactThreshold(model)
+```
+
+**操作步骤：**
+
+1. F5 断点 `autoCompact.ts` `shouldAutoCompact` return true 分支
+2. 向上看日志：`autocompact: tokens=… threshold=… effectiveWindow=…`
+3. compact 执行断点 `compact.ts:411` `compactConversation`
+4. UI 应 yield `buildPostCompactMessages` 的 boundary（`query.ts:711-714`）
+5. 验证 telemetry `tengu_auto_compact_succeeded` 字段 `preCompactTokenCount` / `truePostCompactTokenCount`
+
+**人为复现（dev）：** 连续 `Read` 大文件或 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=30`。
+
+---
 
 #### 案例 L7-2：compact 后 CLAUDE.md 仍是旧的
 
-| 项 | 内容 |
-|----|------|
-| **现象** | compact 后改了 CLAUDE.md 仍 stale |
-| **触发** | `postCompactCleanup` 未清 getUserContext cache |
-| **Harness** | compact 应 invalidate L3 memoize |
-| **排查** | `postCompactCleanup.ts`；主线程 vs subagent 分支 |
-| **验证** | compact → 改 md → 新 turn 是否刷新 |
+**读 `postCompactCleanup.ts:43-70`：**
+
+```typescript
+const isMainThreadCompact =
+  querySource === undefined ||
+  querySource.startsWith('repl_main_thread')
+// 仅 main thread 时：
+getUserContext.cache.clear?.()
+resetGetMemoryFilesCache()
+```
+
+**若 subagent compact 清了 main cache → bug。** 断点确认 `querySource` 与 `isMainThreadCompact`。
+
+---
 
 #### 案例 L7-3：snip 后仍立即 autocompact
 
-| 项 | 内容 |
-|----|------|
-| **现象** | snip 已释放 token 仍触发 autocompact |
-| **触发** | `snipTokensFreed` 未传入 autocompact 阈值计算 |
-| **Harness** | snip 与 autocompact 阈值联动 |
-| **排查** | `deps.autocompact(..., snipTokensFreed)` 参数 |
-| **验证** | 开 HISTORY_SNIP 灌历史，看阈值日志 |
+**读 `query.ts:637-649`：**
 
-#### 案例 L7-4：手动 `/compact` 与自动 compact 行为不同
+```typescript
+const { compactionResult } = await deps.autocompact(
+  messagesForQuery,
+  toolUseContext,
+  { ... },
+  querySource,
+  tracking,
+  snipTokensFreed,  // ← 必须传入 snipCompact 返回值
+)
+```
 
-| 项 | 内容 |
-|----|------|
-| **现象** | 手动 compact 保留更多/更少上下文 |
-| **触发** | `MANUAL_COMPACT_BUFFER_TOKENS` vs `AUTOCOMPACT_BUFFER_TOKENS` |
-| **Harness** | 同一 `compactConversation` 不同 buffer 常量 |
-| **排查** | slash compact 路径 vs autoCompact.ts |
-| **验证** | 同会话分别手动/自动，对比 postCompact message 数 |
+**若改 snip 未 plumbed：** `shouldAutoCompact` 仍用 inflated usage。搜全 repo `snipTokensFreed` 传参链。
+
+---
+
+#### 案例 L7-4：session-memory compact vs full autocompact
+
+**优先顺序（`autoCompact.ts:316-337`）：**
+
+```typescript
+const sessionMemoryResult = await trySessionMemoryCompaction(
+  messages, toolUseContext.agentId, recompactionInfo.autoCompactThreshold,
+)
+if (sessionMemoryResult) {
+  runPostCompactCleanup(querySource)
+  return { wasCompacted: true, compactionResult: sessionMemoryResult }
+}
+// 否则才 compactConversation
+```
+
+**操作：** 断点 `trySessionMemoryCompaction`；查 `{projectDir}/{sessionId}/session-memory/summary.md` 是否更新；对比 full compact 是否产生 `isCompactSummary` user message。
+
+---
+
+#### 案例 L7-5：microcompact 清掉了仍需的 Read 内容
+
+**白名单：** `microCompact.ts:41-50` `COMPACTABLE_TOOLS`。被清内容变为 `TIME_BASED_MC_CLEARED_MESSAGE`。
+
+**保留：** cached MC 保留 **最后 5 个** tool result（`cachedMicrocompact.ts:88-93` `keepRecent: 5`）。
+
+**恢复：** 让模型 **重新 Read** 文件；或依赖 compact 后 `createPostCompactFileAttachments` 恢复最近 read 快照。
 
 ---
 
@@ -1481,9 +1754,9 @@ bun run precheck
 | E | 新 Hook 事件 | X | [X-2](#案例-x-2-pretooluse-修改-tool-input) |
 | F | 队列优先级错 | L2/L5 | [L2-1](#案例-l2-1-连发三条消息只执行了第一条)、[L5-3](#案例-l5-3-turn-中途插队的高优先级-autonomy-命令) |
 | G | 工具 deny | L8 | [L8-1](#案例-l8-1-bash-明明批准过仍被-deny)～[L8-5](#案例-l8-5-auto-模式连续-deny-后突然要人工确认) |
-| H | 突然 autocompact | L7 | [L7-1](#案例-l7-1-对话中途突然变摘要) |
-| I | Memory 未写入 | L4/L10 | [L4-1](#案例-l4-1-长对话后-memdir-无新文件)、[L10-2](#案例-l10-2-p-管道脚本记忆未写入) |
-| J | CLAUDE.md stale | L3/L7 | [L3-1](#案例-l3-1-claudemd-修改不生效)、[L7-2](#案例-l7-2-compact-后-claudemd-仍是旧的) |
+| J | CLAUDE.md stale / token 占用 | L3 | [L3-1](#案例-l3-1-claudemd-修改不生效)、[L3-5](#案例-l3-5-如何读当前-token-占用) |
+| H | 突然 autocompact / 压缩行为 | L7 | [L7-1](#案例-l7-1-对话中途突然变摘要)～[L7-5](#案例-l7-5-microcompact-清掉了仍需的-read-内容) |
+| I | Memory 未写入 / prefetch | L4 | [L4-1](#案例-l4-1-长对话后-memdir-无新文件)～[L4-5](#案例-l4-5-主-agent-写了-memory-extract-仍重复写) |
 | K | 子 agent 异常 | L9 | [L9-1](#案例-l9-1-子-agent-调用了禁止的工具)～[L9-3](#案例-l9-3-子-agent-resume-后上下文丢失) |
 | L | dev/build 行为不一致 | L0 | [L0-1](#案例-l0-1-dev-有-feature生产-build-没有) |
 | M | 断点/debug | L6/L12 | [L6-4](#案例-l6-4-f5-断点打不中-query) |
@@ -1524,4 +1797,4 @@ bun run precheck
 
 ---
 
-**维护：** 新增 Harness 行为或 invariant 时，在对应层 §4–§17 补充 **典型案例** 索引，并在 **§21** 增加完整案例（现象/触发/Harness/排查/验证五段式）。架构分层变更时先改 §1.3 与 §2。
+**维护：** 每层 §4–§17 的「典型案例」必须与 **§21 五段式 + 代码路径** 同步。L3/L7 改动压缩 pipeline 时，务必更新 §7.4 顺序表与 §11.2 函数表。
