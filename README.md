@@ -171,23 +171,21 @@ FEATURE_BUDDY=1 FEATURE_FORK_SUBAGENT=1 bun run dev
 
 各 Feature 的详细说明见 [`docs/features/`](docs/features/) 目录，欢迎投稿补充。
 
-## VS Code 调试
+## VS Code / Cursor 断点调试
 
-TUI (REPL) 模式需要真实终端，无法直接通过 VS Code launch 启动调试。使用 **attach 模式**：
+TUI (REPL) 需真实终端，请用 **Bun 扩展 + attach 模式** 调试 `src/query.ts` 等模块。
 
-### 步骤
+**完整说明书：** [`docs/vscode-f5-debugging.md`](docs/vscode-f5-debugging.md)
 
-1. **终端启动 inspect 服务**：
+### 快速开始
 
-   ```bash
-   bun run dev:inspect
-   ```
+1. 安装扩展 **Bun for Visual Studio Code**（`oven.bun-vscode`），Reload Window
+2. `bun install`
+3. F5 → **「★ Attach REPL → query.ts (首选)」** → attach 后 **F5 继续** → REPL 输入 `hello`
 
-   会输出类似 `ws://localhost:8888/xxxxxxxx` 的地址。
-2. **VS Code 附着调试器**：
+日常终端开发仍用 `bun run dev`；F5 走同进程 `scripts/dev-cli.ts`（详见说明书）。
 
-   - 在 `src/` 文件中打断点
-   - F5 → 选择 **"Attach to Bun (TUI debug)"**
+配置生成：`bun run generate:launch` · 路径验证：`bun run verify:f5` · 手动 inspect：`bun run dev:inspect`
 
 ## Teach Me 学习项目
 

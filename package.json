@@ -46,6 +46,8 @@
     "build:vite:only": "vite build",
     "build:bun": "bun run build.ts",
     "dev": "bun run scripts/dev.ts",
+    "generate:launch": "bun run scripts/generate-vscode-launch.ts",
+    "verify:f5": "bun run scripts/verify-f5-path.ts",
     "dev:inspect": "bun run scripts/dev-debug.ts",
     "prepublishOnly": "bun run build:vite",
     "lint": "biome lint .",

@@ -1,0 +1,5 @@
+{
+  "bun.runtime": "${env:USERPROFILE}\\.bun\\bin\\bun.exe",
+  "bun.debugTerminal.enabled": true,
+  "bun.debugTerminal.stopOnEntry": false
+}

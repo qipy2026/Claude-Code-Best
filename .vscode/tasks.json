@@ -1,27 +1,218 @@
 {
-	"version": "2.0.0",
-	"tasks": [
-		{
-			"label": "Start Claude Code TUI",
-			"type": "shell",
-			"command": "bun run dev:inspect",
-			"isBackground": true,
-			"presentation": {
-				"reveal": "always",
-				"focus": true,
-				"panel": "dedicated",
-				"clear": true
-			},
-			"problemMatcher": {
-				"pattern": {
-					"regexp": "^$"
-				},
-				"background": {
-					"activeOnStart": true,
-					"beginsPattern": ".*Bun Inspector.*",
-					"endsPattern": ".*Listening:.*"
-				}
-			}
-		}
-	]
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "bun: inspect-brk dev-cli (REPL)",
+      "type": "process",
+      "command": "${env:USERPROFILE}\\.bun\\bin\\bun.exe",
+      "args": [
+        "--inspect-brk=127.0.0.1:6499/test",
+        "--feature",
+        "BUDDY",
+        "--feature",
+        "TRANSCRIPT_CLASSIFIER",
+        "--feature",
+        "BRIDGE_MODE",
+        "--feature",
+        "AGENT_TRIGGERS_REMOTE",
+        "--feature",
+        "CHICAGO_MCP",
+        "--feature",
+        "VOICE_MODE",
+        "--feature",
+        "SHOT_STATS",
+        "--feature",
+        "PROMPT_CACHE_BREAK_DETECTION",
+        "--feature",
+        "TOKEN_BUDGET",
+        "--feature",
+        "AGENT_TRIGGERS",
+        "--feature",
+        "ULTRATHINK",
+        "--feature",
+        "BUILTIN_EXPLORE_PLAN_AGENTS",
+        "--feature",
+        "LODESTONE",
+        "--feature",
+        "EXTRACT_MEMORIES",
+        "--feature",
+        "VERIFICATION_AGENT",
+        "--feature",
+        "KAIROS_BRIEF",
+        "--feature",
+        "AWAY_SUMMARY",
+        "--feature",
+        "ULTRAPLAN",
+        "--feature",
+        "DAEMON",
+        "--feature",
+        "ACP",
+        "--feature",
+        "WORKFLOW_SCRIPTS",
+        "--feature",
+        "MONITOR_TOOL",
+        "--feature",
+        "KAIROS",
+        "--feature",
+        "COORDINATOR_MODE",
+        "--feature",
+        "BG_SESSIONS",
+        "--feature",
+        "TEMPLATES",
+        "--feature",
+        "CONNECTOR_TEXT",
+        "--feature",
+        "COMMIT_ATTRIBUTION",
+        "--feature",
+        "DIRECT_CONNECT",
+        "--feature",
+        "EXPERIMENTAL_SKILL_SEARCH",
+        "--feature",
+        "EXPERIMENTAL_SEARCH_EXTRA_TOOLS",
+        "--feature",
+        "POOR",
+        "--feature",
+        "SSH_REMOTE",
+        "--feature",
+        "AUTOFIX_PR",
+        "scripts/dev-cli.ts"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "NODE_ENV": "production"
+        }
+      },
+      "isBackground": true,
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": {
+        "owner": "bun",
+        "pattern": {
+          "regexp": "^$",
+          "file": 1,
+          "location": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "Bun Inspector|Listening:",
+          "endsPattern": "ws://127\\.0\\.0\\.1:6499/test"
+        }
+      }
+    },
+    {
+      "label": "bun: inspect-brk dev-cli (pipe)",
+      "type": "process",
+      "command": "${env:USERPROFILE}\\.bun\\bin\\bun.exe",
+      "args": [
+        "--inspect-brk=127.0.0.1:6499/test",
+        "--feature",
+        "BUDDY",
+        "--feature",
+        "TRANSCRIPT_CLASSIFIER",
+        "--feature",
+        "BRIDGE_MODE",
+        "--feature",
+        "AGENT_TRIGGERS_REMOTE",
+        "--feature",
+        "CHICAGO_MCP",
+        "--feature",
+        "VOICE_MODE",
+        "--feature",
+        "SHOT_STATS",
+        "--feature",
+        "PROMPT_CACHE_BREAK_DETECTION",
+        "--feature",
+        "TOKEN_BUDGET",
+        "--feature",
+        "AGENT_TRIGGERS",
+        "--feature",
+        "ULTRATHINK",
+        "--feature",
+        "BUILTIN_EXPLORE_PLAN_AGENTS",
+        "--feature",
+        "LODESTONE",
+        "--feature",
+        "EXTRACT_MEMORIES",
+        "--feature",
+        "VERIFICATION_AGENT",
+        "--feature",
+        "KAIROS_BRIEF",
+        "--feature",
+        "AWAY_SUMMARY",
+        "--feature",
+        "ULTRAPLAN",
+        "--feature",
+        "DAEMON",
+        "--feature",
+        "ACP",
+        "--feature",
+        "WORKFLOW_SCRIPTS",
+        "--feature",
+        "MONITOR_TOOL",
+        "--feature",
+        "KAIROS",
+        "--feature",
+        "COORDINATOR_MODE",
+        "--feature",
+        "BG_SESSIONS",
+        "--feature",
+        "TEMPLATES",
+        "--feature",
+        "CONNECTOR_TEXT",
+        "--feature",
+        "COMMIT_ATTRIBUTION",
+        "--feature",
+        "DIRECT_CONNECT",
+        "--feature",
+        "EXPERIMENTAL_SKILL_SEARCH",
+        "--feature",
+        "EXPERIMENTAL_SEARCH_EXTRA_TOOLS",
+        "--feature",
+        "POOR",
+        "--feature",
+        "SSH_REMOTE",
+        "--feature",
+        "AUTOFIX_PR",
+        "scripts/dev-cli.ts",
+        "-p",
+        "--model",
+        "deepseek-v4-flash"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "NODE_ENV": "production"
+        }
+      },
+      "isBackground": true,
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": {
+        "owner": "bun",
+        "pattern": {
+          "regexp": "^$",
+          "file": 1,
+          "location": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "Bun Inspector|Listening:",
+          "endsPattern": "ws://127\\.0\\.0\\.1:6499/test"
+        }
+      }
+    }
+  ]
 }
