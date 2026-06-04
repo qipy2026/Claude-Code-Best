@@ -6,14 +6,23 @@
 // ============================================================================
 // MACRO — Bun compile-time constants injected via bunfig.toml [define] (dev)
 // and Bun.build({ define }) (production). See bunfig.toml & build.ts.
-declare namespace MACRO {
-  export const VERSION: string
-  export const BUILD_TIME: string
-  export const FEEDBACK_CHANNEL: string
-  export const ISSUES_EXPLAINER: string
-  export const NATIVE_PACKAGE_URL: string
-  export const PACKAGE_URL: string
-  export const VERSION_CHANGELOG: string
+// global.d.ts 或 macro.d.ts
+export {}
+
+declare global {
+  // 声明全局值 MACRO（可直接访问，无需 globalThis）
+  namespace MACRO {
+    export const VERSION: string
+    export const BUILD_TIME: string
+    export const FEEDBACK_CHANNEL: string
+    export const ISSUES_EXPLAINER: string
+    export const NATIVE_PACKAGE_URL: string
+    export const PACKAGE_URL: string
+    export const VERSION_CHANGELOG: string
+  }
+
+  // 关键：让 globalThis 也具有 MACRO 属性
+  var MACRO: typeof MACRO
 }
 
 // ============================================================================
