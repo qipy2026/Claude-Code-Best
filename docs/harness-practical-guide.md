@@ -1,568 +1,821 @@
-# Harness 实战指导
+# Harness 实战指导 — 生产级智能体架构
 
-本文档面向**要改 Claude Code Best 运行时编排层**的开发者。这里的 **Harness** 不是某个文件名，而是：**包裹 LLM 的确定性执行层**——负责把用户输入变成消息、跑 Hook、管权限、排队、驱动 query 循环、收尾 autonomy 生命周期，并把 side channel（hints、telemetry）从模型可见文本里剥离。
+本文档面向**要改 Claude Code Best 运行时编排层**的开发者。这里的 **Harness** 不是某个文件名，而是：**包裹 LLM 的确定性执行层**——在模型不可控的生成之外，保证输入解析、上下文、权限、工具、调度、压缩、收尾等行为**可预测、可测试、可运维**。
 
-功能开关与 `/slash` 用法见 [`docs/features/`](features/)；Hook 协议见 [`docs/extensibility/hooks.mdx`](extensibility/hooks.mdx)。本文讲**怎么读代码、怎么改、怎么测、踩哪些坑**。
+功能开关与 `/slash` 用法见 [`docs/features/`](features/)；Hook 协议见 [`docs/extensibility/hooks.mdx`](extensibility/hooks.mdx)。环境搭建与日常命令见 [`practical-handbook.md`](practical-handbook.md)。
 
 ---
 
 ## 目录
 
-1. [Harness 是什么](#1-harness-是什么)
-2. [两条运行时路径](#2-两条运行时路径)
-3. [主调用链（REPL）](#3-主调用链repl)
-4. [子系统地图](#4-子系统地图)
-5. [Tool Harness 与权限管道（详解）](#5-tool-harness-与权限管道详解)
-6. [关键契约（改之前必读）](#6-关键契约改之前必读)
-7. [配置型 Harness：settings 与 Hooks](#7-配置型-harnessssettings-与-hooks)
-8. [测试 Harness：怎么验证你的改动](#8-测试-harness怎么验证你的改动)
-9. [实战场景 walkthrough](#9-实战场景-walkthrough)
-10. [调试与排错](#10-调试与排错)
-11. [延伸阅读](#11-延伸阅读)
+**Part I — 架构总览**
+
+1. [设计原则与分层模型](#1-设计原则与分层模型)
+2. [端到端生命周期](#2-端到端生命周期)
+3. [运行时形态（REPL / Headless / ACP）](#3-运行时形态repl--headless--acp)
+
+**Part II — 各层 Harness 方案（按生产链路顺序）**
+
+4. [L0 引导与入口 Harness](#4-l0-引导与入口-harness)
+5. [L1 会话状态 Harness](#5-l1-会话状态-harness)
+6. [L2 输入摄取 Harness](#6-l2-输入摄取-harness)
+7. [L3 上下文与 Prompt Harness](#7-l3-上下文与-prompt-harness)
+8. [L4 记忆 Harness](#8-l4-记忆-harness)
+9. [L5 调度与 Autonomy Harness](#9-l5-调度与-autonomy-harness)
+10. [L6 推理循环 Harness（Query / API）](#10-l6-推理循环-harnessquery--api)
+11. [L7 上下文窗口 Harness（压缩）](#11-l7-上下文窗口-harness压缩)
+12. [L8 工具与权限 Harness](#12-l8-工具与权限-harness)
+13. [L9 子 Agent Harness](#13-l9-子-agent-harness)
+14. [L10 Turn 收尾 Harness](#14-l10-turn-收尾-harness)
+15. [L11 输出与 Side-Channel Harness](#15-l11-输出与-side-channel-harness)
+16. [L12 可观测性 Harness](#16-l12-可观测性-harness)
+
+**Part III — 横切能力**
+
+17. [配置型 Harness：Settings 与 Hooks](#17-配置型-harnesssettings-与-hooks)
+18. [关键契约（改之前必读）](#18-关键契约改之前必读)
+19. [测试 Harness](#19-测试-harness)
+20. [调试与排错索引](#20-调试与排错索引)
+
+**Part IV — 实战手册**
+
+21. [场景 Playbook（按症状）](#21-场景-playbook按症状)
+22. [改代码检查清单（按层）](#22-改代码检查清单按层)
+23. [延伸阅读](#23-延伸阅读)
 
 ---
 
-## 1. Harness 是什么
+# Part I — 架构总览
 
-### 1.1 分工
+## 1. 设计原则与分层模型
 
-| 层 | 职责 | 典型文件 |
-|----|------|----------|
-| **模型** | 生成文本 / tool_use | `src/services/api/claude.ts` |
-| **Harness** | 输入解析、队列、Hook、权限、turn 生命周期、消息规范化 | 见 §4 |
-| **工具** | 执行副作用（读写文件、bash 等） | `packages/builtin-tools/` |
+### 1.1 模型 vs Harness vs 工具
 
-代码里出现 “harness” 时，通常指下面之一：
+| 层 | 职责 | 谁保证确定性 |
+|----|------|--------------|
+| **模型** | 生成文本 / `tool_use` 意图 | 概率性，不可依赖 |
+| **Harness** | 编排、 gate、压缩、权限、队列、生命周期 | **必须 100% 代码保证** |
+| **工具** | 副作用（读写、bash、MCP 等） | 工具实现 + Harness 权限管道 |
 
-- **Prompt-submit harness**：`handlePromptSubmit` 包住一整轮用户输入
-- **Autonomy harness**：`autonomyRuns` + `autonomyQueueLifecycle` 管理 scheduled/managed flow
-- **Side-channel harness**：`claudeCodeHints` 从 shell 输出里剥 `<claude-code-hint />`
-- **Test harness**：单测/集成测里构造 `ToolUseContext`、mock 依赖（非生产路径）
-- **Tool harness**：工具注册、可见性、执行编排、`canUseTool` 权限管道（见 §5）
-- **Eval harness**：GrowthBook 等通过 env 强制实验分组（`src/services/analytics/growthbook.ts`）
+### 1.2 核心原则
 
-### 1.2 一句话原则
+> **「每当 X 就 Y」不能交给模型或 memory——必须写在 Harness 代码、settings Hook 或策略配置里。**
 
-> **模型不能替你执行 “每当 X 就 Y”**——那必须写在 settings Hook 或 harness 代码里。`updateConfig` skill 的说明也强调：自动化行为由 harness 执行，不是 Claude 的记忆。
+`updateConfig` skill 的说明与此一致：自动化行为由 harness 执行，不是 Claude 的「记忆」。
 
----
+### 1.3 十二层 Harness 模型
 
-## 2. 两条运行时路径
+生产级智能体在本仓库中按 **L0–L12** 分层；下层为上层提供不变量，上层不得绕过下层 gate。
 
-同一套 harness 逻辑，有两种入口形态：
-
+```mermaid
+flowchart TB
+  subgraph entry ["L0–L2 入口"]
+    L0[L0 引导]
+    L1[L1 会话状态]
+    L2[L2 输入摄取]
+  end
+  subgraph context ["L3–L4 认知上下文"]
+    L3[L3 上下文 / Prompt]
+    L4[L4 记忆]
+  end
+  subgraph orchestration ["L5–L8 编排执行"]
+    L5[L5 调度 / Autonomy]
+    L6[L6 Query / API 循环]
+    L7[L7 窗口压缩]
+    L8[L8 工具 / 权限]
+  end
+  subgraph lifecycle ["L9–L12 生命周期"]
+    L9[L9 子 Agent]
+    L10[L10 Turn 收尾]
+    L11[L11 输出 / Side-channel]
+    L12[L12 可观测性]
+  end
+  L0 --> L1 --> L2 --> L3
+  L3 --> L4
+  L2 --> L5
+  L3 --> L6
+  L4 --> L6
+  L5 --> L6
+  L6 --> L7 --> L8
+  L8 --> L6
+  L6 --> L9
+  L6 --> L10
+  L8 --> L11
+  L6 -.-> L12
+  L8 -.-> L12
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  交互式 REPL（TUI）                                            │
-│  REPL.tsx → handlePromptSubmit → processUserInput → query    │
-└─────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────┐
-│  Headless / pipe / SDK                                       │
-│  main.tsx → cli/print.ts → （同源 processUserInput / query）   │
-│  structuredIO.ts 处理 control 协议与 elicitation               │
-└─────────────────────────────────────────────────────────────┘
-```
+| 层 | Harness 名称 | 一句话 |
+|----|--------------|--------|
+| L0 | 引导与入口 | 快速路径、init、feature 注入 |
+| L1 | 会话状态 | sessionId、CWD、AppState 单例 |
+| L2 | 输入摄取 | 提交、排队、Hook、slash |
+| L3 | 上下文 / Prompt | CLAUDE.md、system prompt、attachment |
+| L4 | 记忆 | memdir、extract、prefetch、session-memory |
+| L5 | 调度 / Autonomy | cron、HEARTBEAT、run 状态机 |
+| L6 | Query / API | `queryLoop`、流式、provider |
+| L7 | 窗口压缩 | snip → microcompact → autocompact |
+| L8 | 工具 / 权限 | 注册、执行、allow/deny/ask |
+| L9 | 子 Agent | fork、工具黑名单、trace 归属 |
+| L10 | Turn 收尾 | stopHooks、后台 agent、shutdown |
+| L11 | 输出 / Side-channel | hints 剥离、headless 协议 |
+| L12 | 可观测性 | Langfuse、checkpoint、analytics |
 
-| 路径 | 入口 | Harness 差异 |
-|------|------|----------------|
-| REPL | `src/screens/REPL.tsx` | `QueryGuard`、Ink UI、排队可视化 |
-| Headless | `src/cli/print.ts` | 无 React；`structuredIO` 队列 |
-| ACP | `--acp` | `src/services/acp/`，权限桥接 |
-| 子进程 CLI 测 | `dist/cli.js` | 集成测用 build 产物（见 §7.3） |
-
-**实战提示：** 改 `handlePromptSubmit` 或 `query.ts` 的 autonomy 消费逻辑时，**同时检查** `print.ts` 是否也有对称路径（见 `docs/internals/autonomy-jira.md`）。
+**横切：** §17 Settings/Hooks、§18 契约、§19 测试——作用于多层。
 
 ---
 
-## 3. 主调用链（REPL）
+## 2. 端到端生命周期
 
-用户按 Enter 后，典型顺序：
+用户按 Enter（或 pipe 一行输入）到 turn 结束，Harness 保证的顺序：
 
 ```mermaid
 sequenceDiagram
-  participant UI as REPL / PromptInput
-  participant HPS as handlePromptSubmit
-  participant PUI as processUserInput
-  participant HK as hooks.js
-  participant Q as query.ts
+  participant UI as REPL / print.ts
+  participant L2 as L2 输入摄取
+  participant L3 as L3 上下文
+  participant L6 as L6 queryLoop
+  participant L7 as L7 压缩
   participant API as claude.ts
+  participant L8 as L8 工具
+  participant L10 as L10 stopHooks
 
-  UI->>HPS: input, pastedContents, abortController
-  HPS->>HPS: QueryGuard / enqueue / 打断可中断工具
-  HPS->>PUI: executeUserInput
-  PUI->>HK: UserPromptSubmit hooks
-  PUI->>PUI: slash command / skill / 附件
-  alt shouldQuery
-    HPS->>Q: onQuery → query()
-    Q->>API: callModel 流式
-    Q->>Q: 工具循环 / 队列 attachment 消费
+  UI->>L2: handlePromptSubmit
+  L2->>L2: QueryGuard / queue / UserPromptSubmit hooks
+  L2->>L3: processUserInput → attachments
+  L2->>L6: onQuery → query()
+  loop queryLoop iteration
+    L6->>L7: snip / microcompact / autocompact
+    L6->>L3: prependUserContext + fullSystemPrompt
+    L6->>API: callModel (stream)
+    API-->>L6: assistant + tool_use
+    L6->>L8: StreamingToolExecutor
+    L8-->>L6: tool_result
   end
-  HPS->>HPS: finalizeAutonomyCommandsForTurn
+  L6->>L10: handleStopHooks
+  L2->>L2: finalizeAutonomyCommandsForTurn
 ```
 
-### 3.1 关键函数
-
-| 阶段 | 函数 | 文件 |
-|------|------|------|
-| 提交入口 | `handlePromptSubmit` | `src/utils/handlePromptSubmit.ts` |
-| 单轮执行 | `executeUserInput` | 同上 |
-| 输入语义 | `processUserInput` | `src/utils/processUserInput/processUserInput.ts` |
-| Slash | `processSlashCommand` | `src/utils/processUserInput/processSlashCommand.tsx` |
+| 阶段 | 关键入口 | 文件 |
+|------|----------|------|
+| 提交 | `handlePromptSubmit` | `src/utils/handlePromptSubmit.ts` |
+| 语义解析 | `processUserInput` | `src/utils/processUserInput/processUserInput.ts` |
 | API 循环 | `query` / `queryLoop` | `src/query.ts` |
 | 会话编排 | `QueryEngine` | `src/QueryEngine.ts` |
-
-### 3.2 QueryGuard 与排队
-
-- **`QueryGuard`**（`src/utils/QueryGuard.ts`）：同一时刻只允许一个 in-flight query；排队时 `reserve()` / `release()`。
-- **`messageQueueManager`**：用户连续输入时先入队；`useQueueProcessor` 在 turn 结束后 `dequeue` 再进 `handlePromptSubmit`（带 `queuedCommands`）。
-- **打断**：若仅有 “cancel-interrupt” 类工具在跑，新输入会 abort 当前 turn 并把输入重新入队——见 `handlePromptSubmit.test.ts`。
-
-改排队逻辑时，读这三处：**`handlePromptSubmit`**、**`useQueueProcessor.ts`**、**`messageQueueManager.ts`**。
+| 单次 API | `queryModelWithStreaming` | `src/services/api/claude.ts` |
 
 ---
 
-## 4. 子系统地图
+## 3. 运行时形态（REPL / Headless / ACP）
 
-§4 为索引；**Tool 注册 / 执行 / 权限白名单** 的完整梳理见 **[§5](#5-tool-harness-与权限管道详解)**（初版 §4.1 过简，易误以为 harness 不含权限管理）。
+同一套 L0–L12 逻辑，三种入口壳：
 
-### 4.1 权限管道（摘要）
+| 形态 | 入口 | Harness 差异 |
+|------|------|--------------|
+| **REPL** | `REPL.tsx` | `QueryGuard`、Ink 权限 UI、排队可视化 |
+| **Headless** | `cli/print.ts` | 无 React；`structuredIO` 队列与 elicitation |
+| **ACP** | `--acp` | `src/services/acp/`，`createAcpCanUseTool` 权限桥 |
+| **集成测** | `dist/cli.js` 子进程 | 见 §19.3 |
 
-工具执行前不走模型，而走 harness 权限链（详见 §5.2–§5.4）：
+**Invariant：** 改 `handlePromptSubmit` 或 `query.ts` 的 autonomy / 队列逻辑时，**必须对称检查** `print.ts`（见 `docs/internals/autonomy-jira.md`）。
+
+---
+
+# Part II — 各层 Harness 方案
+
+## 4. L0 引导与入口 Harness
+
+### 4.1 职责
+
+- 零模块快速路径（`--version`）
+- 一次性 init（telemetry、config、trust）
+- Feature / MACRO 注入（dev vs build）
+- Ablation 基线 env（须在 import 工具模块**之前**）
+
+### 4.2 关键文件
+
+| 文件 | 作用 |
+|------|------|
+| `src/entrypoints/cli.tsx` | 快速路径分发 → `main.tsx` |
+| `src/entrypoints/init.ts` | 一次性初始化 |
+| `src/main.tsx` | Commander 子命令注册 |
+| `scripts/dev.ts` / `build.ts` | `feature()` 默认集 |
+| `scripts/defines.ts` | 版本等 MACRO |
+
+### 4.3 Harness 保证
+
+- `feature('X')` **只能**出现在 `if` 或三元条件位（Bun 编译器限制）
+- `ABLATION_BASELINE` 在 `cli.tsx` 顶部——BashTool/AgentTool 在 load 时 capture 常量，不能挪到 `init.ts`
+- 快速路径命令不加载完整 REPL harness，避免 RSS 暴涨
+
+### 4.4 实战
+
+| 任务 | 做法 |
+|------|------|
+| 新子命令快速路径 | 在 `cli.tsx` `main()` 优先级链插入，feature-gate |
+| 新 feature 默认值 | 改 `scripts/dev.ts` + `build.ts` `DEFAULT_BUILD_FEATURES` |
+| Ablation 实验 | env 注入放 `cli.tsx`，勿依赖运行时 settings |
+
+---
+
+## 5. L1 会话状态 Harness
+
+### 5.1 职责
+
+- 全局单例：`sessionId`、`cwd`、`projectRoot`、model override
+- `AppState`（messages、permissions、MCP、tools）
+- 会话持久化路径（`.claude/projects/...`）
+
+### 5.2 关键文件
+
+| 文件 | 作用 |
+|------|------|
+| `src/bootstrap/state.ts` | 模块级 session 单例 |
+| `src/state/AppState.tsx` / `AppStateStore.ts` | React 侧状态 |
+| `src/state/store.ts` | Zustand-style store |
+| `src/utils/sessionStorage.ts` | 项目目录编码 |
+
+### 5.3 Harness 保证
+
+- `getSessionId()` 在整个进程内稳定；harness 路径（session-memory、plans）都挂 sessionId
+- 改 CWD / project root 时必须同步 permission working directories
+- 测试 mock 链：`log.ts` / `debug.ts` → `bootstrap/state.ts` 有模块加载副作用
+
+### 5.4 实战
+
+| 症状 | 排查 |
+|------|------|
+| 会话 resume 后路径错 | `sessionStorage` + `getProjectDir` |
+| 权限 working dir 不对 | `bootstrap/state` 的 CWD vs `additionalWorkingDirectories` |
+| 单测随机 UUID 污染 | mock `bootstrap/state` 或使用 `tests/mocks/` |
+
+---
+
+## 6. L2 输入摄取 Harness
+
+### 6.1 职责
+
+- 串行化用户输入（`QueryGuard`）
+- 排队与 dequeue（`messageQueueManager`）
+- UserPromptSubmit / slash / skill 分发
+- 打断可中断工具
+
+### 6.2 数据流
 
 ```
-tool_use 块完成
-  → StreamingToolExecutor / runTools
-  → canUseTool → hasPermissionsToUseTool
-  → 规则匹配 (allow/deny/ask) + tool.checkPermissions
-  → PermissionRequest / PreToolUse hooks / UI 或 classifier
-  → runToolUse → tool.call()
+PromptInput → handlePromptSubmit → executeUserInput → processUserInput
+  ├─ executeUserPromptSubmitHooks (可 block)
+  ├─ processSlashCommand
+  └─ shouldQuery ? onQuery → query()
+→ finalizeAutonomyCommandsForTurn
 ```
 
-改 “为什么这个工具被拦了” → **§5.4** 决策顺序表。
+### 6.3 关键文件
 
-### 4.2 Hook 执行引擎
+| 组件 | 文件 |
+|------|------|
+| 提交入口 | `src/utils/handlePromptSubmit.ts` |
+| 排队 | `src/utils/messageQueueManager.ts`、`useQueueProcessor.ts` |
+| 互斥 | `src/utils/QueryGuard.ts` |
+| Slash | `processSlashCommand.tsx` |
 
-- 事件列表：`HOOK_EVENTS` in `src/entrypoints/sdk/coreTypes.ts`（27 种）
-- 执行：`executeHooks` in `src/utils/hooks.ts`
-- 用户提交：`executeUserPromptSubmitHooks` 在 `processUserInput` 里调用
+### 6.4 Harness 保证
 
-Harness 对 Hook 的保证：
+- **同一时刻只有一个 in-flight query**（`QueryGuard.reserve/release`）
+- 连续输入先入队；turn 结束后 `dequeue` 再进 `handlePromptSubmit`（带 `queuedCommands`）
+- 仅 cancel-interrupt 类工具在跑时，新输入 abort 当前 turn 并重新入队
+- 非 trusted workspace：**跳过** Hook 执行（防 RCE）
 
-- 非 trusted workspace 会 **skip**（防 RCE）
-- `CLAUDE_CODE_SIMPLE=1` 可关闭 Hook
-- 同步/异步 Hook 有 timeout；结果可 **block** 提交或 **inject** 上下文
+### 6.5 实战
 
-### 4.3 Autonomy 生命周期
+改排队逻辑必读：**`handlePromptSubmit`**、**`useQueueProcessor.ts`**、**`messageQueueManager.ts`**。
 
-Managed flow / HEARTBEAT / cron / proactive tick 会把 prompt **入队**为带 `autonomy.runId` 的 `QueuedCommand`。
+单测模板：`src/__tests__/handlePromptSubmit.test.ts`。
+
+---
+
+## 7. L3 上下文与 Prompt Harness
+
+### 7.1 职责
+
+在每次 `callModel` 前组装 **system prompt + messages**，分三条通道：
+
+| 通道 | 函数 | 注入位置 | 内容 |
+|------|------|----------|------|
+| **System prompt** | `getSystemPrompt()` | API `system` | 工具说明、memory 段、MCP、env |
+| **User context** | `getUserContext()` → `prependUserContext()` | messages 头部 meta | CLAUDE.md、日期 |
+| **System context** | `getSystemContext()` → `appendSystemContext()` | system 尾部 | git status |
+| **Turn attachments** | `getAttachmentMessages()` | 每轮 user turn | plan、queue、delta 等 |
+
+### 7.2 关键文件
+
+| 模块 | 文件 |
+|------|------|
+| 会话 context | `src/context.ts` |
+| 注入 API | `src/utils/api.ts` |
+| CLAUDE.md 发现 | `src/utils/claudemd.ts` |
+| System prompt 段 | `src/constants/prompts.ts` |
+| Turn 级注入 | `src/utils/attachments.ts` |
+
+### 7.3 Harness 保证
+
+- `getUserContext` / `getSystemContext`：**lodash memoize**，会话内算一次；`setSystemPromptInjection()` 会 `cache.clear()`
+- `claudeMd` 单独进 `<project-instructions>`，不混在 “may or may not be relevant” disclaimer 里
+- `filterInjectedMemoryFiles` 避免 CLAUDE.md 与 L4 memory 段重复 token
+- `NODE_ENV=test` 时 `prependUserContext` **直接 return 原 messages**——单测不覆盖注入，需集成测
+
+### 7.4 CLAUDE.md 开关
+
+| 条件 | 行为 |
+|------|------|
+| `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` | 硬关 |
+| `--bare` 且无 `--add-dir` | 跳过自动 walk |
+| `--add-dir` | 显式目录仍加载 |
+
+### 7.5 Attachment 时机分类
+
+| 类型 | 时机 | 示例 |
+|------|------|------|
+| Session 级 | memoize | CLAUDE.md、git |
+| Turn 级 | 每次 user input | plan mode、autonomy queue |
+| Async prefetch | turn 开始 fire-and-forget | relevant memory（§8.4）、skill discovery |
+
+### 7.6 实战
+
+「CLAUDE.md 改了但模型还用旧的」→ 查 memoize 是否被 `postCompactCleanup` 清掉，不是模型问题。
+
+---
+
+## 8. L4 记忆 Harness
+
+### 8.1 职责
+
+三条**独立**路径，勿混为一谈：
+
+| 路径 | 生命周期 | 机制 |
+|------|----------|------|
+| **持久 memdir** | 跨会话 | `MEMORY.md` + sidecar 文件 |
+| **Turn 结束提取** | 异步后台 | `extractMemories` |
+| **Turn 内 recall** | 当前 turn | prefetch + `nested_memory` |
+| **Session-memory** | 当前 session | compact 摘要、plan spill |
+
+### 8.2 开关链（`src/memdir/paths.ts`）
+
+`isAutoMemoryEnabled()` 优先级：
+
+1. `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` → OFF
+2. `CLAUDE_CODE_SIMPLE` / `--bare` → OFF
+3. CCR 且无 `CLAUDE_CODE_REMOTE_MEMORY_DIR` → OFF
+4. `settings.autoMemoryEnabled`
+5. 默认 ON
+
+`ensureMemoryDirExists()` — **Harness guarantees the directory exists**。
+
+### 8.3 System prompt 注入
+
+```
+getSystemPrompt() → loadMemoryPrompt()
+  → buildMemoryPrompt → MEMORY.md (≤200 行 & ≤25KB 截断)
+```
+
+### 8.4 Turn 内 Prefetch
+
+```ts
+// query.ts — 每 user turn 一次
+using pendingMemoryPrefetch = startRelevantMemoryPrefetch(messages, toolUseContext)
+```
+
+- `findRelevantMemories`：Sonnet side-query，最多 5 文件
+- Poor mode / 单词 prompt / `MAX_SESSION_BYTES` 跳过
+- `using` dispose → abort + `tengu_memdir_prefetch_collected`
+
+### 8.5 Turn 结束 extractMemories
+
+触发：`stopHooks.ts` → `handleStopHooks`（模型无 pending tool）
+
+条件：`feature('EXTRACT_MEMORIES')` && 主线程 && `isExtractModeActive()` && !bare && !poor && `isAutoMemoryEnabled()`
+
+实现：`runForkedAgent` 写 memdir；与主 agent 手写 memory 去重（`hasMemoryWritesSince`）。
+
+Headless `-p`：`print.ts` → `drainPendingExtraction` 再 shutdown。
+
+### 8.6 Session-memory 路径
+
+| 路径 | 用途 |
+|------|------|
+| `{projectDir}/{sessionId}/session-memory/` | 会话摘要 |
+| `plans/`、`tool-results/` | plan harness、大结果 spill |
+
+`filesystem.ts` 步骤 7：`checkReadableInternalPath` 允许 Read harness 路径。
+
+### 8.7 实战
+
+「没生成 memory 文件」→ 查 feature + poor + bare + 非交互 gate，不是模型「不想记」。
+
+---
+
+## 9. L5 调度与 Autonomy Harness
+
+### 9.1 职责
+
+Managed flow / HEARTBEAT / cron / proactive 将 prompt **入队**为带 `autonomy.runId` 的 `QueuedCommand`，由 harness 消费——**不由模型自行调度**。
+
+### 9.2 状态机
 
 | 模块 | 职责 |
 |------|------|
-| `autonomyRuns.ts` | run 状态机：queued → running → completed/failed/cancelled |
+| `autonomyRuns.ts` | queued → running → completed / failed / cancelled |
 | `autonomyQueueLifecycle.ts` | turn 开始 claim、turn 结束 finalize |
 | `handlePromptSubmit` | turn 结束后 `finalizeAutonomyCommandsForTurn` |
-| `query.ts` | turn **中途** 从队列 drain 高优先级 command 作 attachment |
+| `query.ts` | turn **中途** drain 高优先级 command → attachment |
 
-**两个 finalize 入口必须一致：**
+### 9.3 两个 finalize 入口（Invariant）
 
-1. 正常路径：`handlePromptSubmit` / `print.ts` 在 `processUserInput` 返回后 finalize  
-2. 中途消费：`query.ts` 里 `claimConsumableQueuedAutonomyCommands` + turn 结束时 `finalizeAutonomyCommandsForTurn`
+1. **正常路径：** `handlePromptSubmit` / `print.ts` 在 `processUserInput` 返回后 finalize
+2. **Mid-turn 消费：** `query.ts` → `claimConsumableQueuedAutonomyCommands` + turn 结束 `finalizeAutonomyCommandsForTurn`
 
-详见 `docs/internals/autonomy-jira.md`、`docs/agent/sur-loop-scheduled-oom.md`。
+二者语义必须一致，否则出现 AUT-001 类 stuck / 叠 tick bug。
 
-### 4.4 Claude Code Hints（side channel）
+### 9.4 Deferred completion 契约
 
-`src/utils/claudeCodeHints.ts`：
+KAIROS 等 slash **detach 后台**但立刻返回 → slash 返回 `{ deferAutonomyCompletion: true }`；`handlePromptSubmit` 维护 `deferredAutonomyRunIds`，**跳过**即时 finalize；后台结束时自行 `finalizeAutonomyRunCompleted/Failed`。
 
-- Bash 等工具输出里可出现 `<claude-code-hint />`
-- Harness **剥掉**后再把 stdout 给模型
-- UI 侧最多展示一条 install 提示（plugin marketplace）
+详见 §18.1、`docs/internals/autonomy-jira.md`。
 
-这是 **harness-only 通道**：模型看不见 hint 行。
+### 9.5 实战
 
-### 4.5 Workload 与 profiling
-
-- `runWithWorkload`（`handlePromptSubmit` 包住 turn）— 统计/归因用
-- `queryCheckpoint` / `startQueryProfile` — 性能剖析；F5 调试时可对照
-
-### 4.6 内部 harness 路径（文件系统）
-
-`src/utils/permissions/filesystem.ts` 允许读取 **harness 控制目录**（session-memory、plans、tool-results 等），模型 arbitrary 读路径仍受规则约束。
+- stale run → `removeFromQueue`，**不要**发给模型
+- 改 drain → 回归 `autonomyRuns.test.ts` + 集成测
 
 ---
 
-## 5. Tool Harness 与权限管道（详解）
+## 10. L6 推理循环 Harness（Query / API）
 
-初版文档把 Tool 层写成「只有 `packages/builtin-tools/` 副作用」，**遗漏了 harness 对工具的注册、可见性、执行编排和权限治理**。下面按代码真实结构梳理。
+### 10.1 职责
 
-### 5.1 三层分工
+- `query()` 包装 trace 生命周期、autonomy finalize、`finally` 清理
+- `queryLoop`：压缩 → callModel → 工具循环 → 终止条件
+- Provider 路由、`claude.ts` 流式适配
 
-| 层 | 职责 | 关键文件 |
-|----|------|----------|
-| **工具实现** | `call()`、`checkPermissions()`、inputSchema | `packages/builtin-tools/src/tools/*/` |
-| **Tool harness** | 组装工具列表、延迟加载、执行顺序、注入 `canUseTool` | `src/tools.ts`、`src/services/tools/*` |
-| **Permission harness** | 白名单/黑名单/询问规则、模式、classifier、持久化 | `src/utils/permissions/*`、`useCanUseTool.tsx` |
+### 10.2 分工边界
 
-模型只产生 `tool_use`；**能否执行、执行几次、并发与否** 全由 harness 决定。
+| 模块 | 边界 |
+|------|------|
+| **`query.ts`** | 多轮 tool loop、压缩、attachment 消费、autonomy drain |
+| **`claude.ts`** | **单次** API 请求：参数构建、流式事件、重试 |
+| **`QueryEngine.ts`** | REPL 侧编排：compaction 边界、file history、turn bookkeeping |
 
-### 5.2 工具注册与可见性（API 白名单）
+调用链：`REPL → query() → deps.callModel (= queryModelWithStreaming) → queryModel → Provider`。
+
+### 10.3 queryLoop 内 invariant
+
+- `messagesForQuery = getMessagesAfterCompactBoundary(messages)`
+- 删除 stale `toolUseResult`  payload（防长会话 RSS）
+- `applyToolResultBudget` 在 microcompact **之前**
+- Prefetch：`startRelevantMemoryPrefetch`、`startSkillDiscoveryPrefetch` 用 `using` 保证 dispose
+- `query` 的 `finally`：autonomy finalize、Langfuse end/flush、Performance buffer clear
+
+### 10.4 实战
+
+F5 断点：`query.ts` 的 `queryLoop`；API 单次请求断 `claude.ts` 的 `queryModel`。见 [`vscode-f5-debugging.md`](vscode-f5-debugging.md)。
+
+---
+
+## 11. L7 上下文窗口 Harness（压缩）
+
+### 11.1 职责
+
+Token 逼近上限时 **确定性瘦身**——模型不能自己删历史。
+
+### 11.2 压缩链（每次 iteration、callModel 前）
+
+| 顺序 | 模块 | Feature | 作用 |
+|------|------|---------|------|
+| 1 | `snipCompactIfNeeded` | `HISTORY_SNIP` | 截断远端历史；`snipTokensFreed` 参与阈值 |
+| 2 | `microcompact` | 始终 | 清大 tool_result / cache edit |
+| 3 | `applyCollapsesIfNeeded` | `CONTEXT_COLLAPSE`（默认关） | 读时投影，**先于** autocompact |
+| 4 | `autocompact` | 始终 | 超阈 fork 摘要 |
+
+阈值：`getEffectiveContextWindowSize(model)` = 窗口 − summary 预留（~20k）；buffer 按窗口阶梯 13k / 30k / 50k。
+
+### 11.3 Harness 保证
+
+- 压缩成功 → `buildPostCompactMessages` 替换 `messagesForQuery`，yield boundary 给 UI
+- `consecutiveFailures` 熔断不可恢复超限
+- compact 后 → `postCompactCleanup` 清 `getUserContext` cache
+- `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 可人为缩小触发窗口
+
+### 11.4 实战
+
+跟 checkpoint：`query_snip_*` → `query_microcompact_*` → `query_autocompact_*` + `tengu_auto_compact_succeeded`。
+
+---
+
+## 12. L8 工具与权限 Harness
+
+### 12.1 三层分工
+
+| 层 | 职责 | 文件 |
+|----|------|------|
+| 工具实现 | `call()`、`checkPermissions()` | `packages/builtin-tools/` |
+| Tool harness | 注册、延迟加载、执行编排 | `src/tools.ts`、`StreamingToolExecutor.ts` |
+| Permission harness | allow/deny/ask、mode、classifier | `src/utils/permissions/*` |
+
+模型只产生 `tool_use`；**能否执行、并发与否** 全由 L8 决定。
+
+### 12.2 工具注册 → API
 
 ```
-src/tools.ts (getTools / 条件加载)
-  → ToolUseContext.options.tools
-  → claude.ts: toolToAPISchema → 发给模型的 tools 数组
-  → query.ts: StreamingToolExecutor / runTools
+getTools → ToolUseContext.options.tools
+  → claude.ts toolToAPISchema
+  → StreamingToolExecutor / runTools
 ```
 
 | 机制 | 作用 |
 |------|------|
-| **`CORE_TOOLS`**（`src/constants/tools.ts`） | 延迟工具（SearchExtraTools）白名单：不在 CORE 的工具可 defer |
-| **`ALL_AGENT_DISALLOWED_TOOLS`** | 子 Agent 禁止携带的工具黑名单 |
-| **`tool.isEnabled()` / feature flag** | 运行时是否注册（如 SleepTool、MonitorTool） |
-| **`allowedTools`（slash 返回）** | 单轮限制可用工具子集 |
-| **MCP 动态工具** | 连接后注入；SearchExtraTools 按需 ExecuteExtraTool |
+| `CORE_TOOLS` | 延迟工具白名单 |
+| `ALL_AGENT_DISALLOWED_TOOLS` | 子 Agent 黑名单 |
+| `allowedTools`（slash） | 单轮工具子集 |
+| MCP | 连接后动态注入 |
 
-**注意：** API 里看到的 tools 列表 ≠ 会话里 `options.tools` 全集（延迟工具可能只在 ExecuteExtraTool 路径出现）。
+### 12.3 执行链
 
-### 5.3 工具执行 Harness（query 内）
-
-```mermaid
-sequenceDiagram
-  participant Q as query.ts
-  participant API as claude.ts
-  participant STE as StreamingToolExecutor
-  participant CUT as canUseTool
-  participant T as tool.call()
-
-  Q->>API: deps.callModel (stream)
-  API-->>Q: assistant + tool_use blocks
-  Q->>STE: addToolUse (流式) 或 runTools (批处理)
-  STE->>CUT: hasPermissionsToUseTool
-  alt allow
-    STE->>T: runToolUse
-    T-->>Q: tool_result message
-  else ask
-    CUT-->>Q: UI / classifier / deny
-  end
-  Q->>API: 下一轮 callModel (带 tool_result)
+```
+tool_use 完成 → StreamingToolExecutor
+  → canUseTool → hasPermissionsToUseToolInner
+  → PreToolUse / PermissionRequest hooks
+  → runToolUse → tool.call()
 ```
 
-| 组件 | 文件 | 说明 |
-|------|------|------|
-| 流式执行 | `StreamingToolExecutor.ts` | 边收 SSE 边排队；并发安全工具可并行 |
-| 批处理 | `toolOrchestration.ts` → `runTools` | 非流式或 fallback 路径 |
-| 单次执行 | `toolExecution.ts` → `runToolUse` | PreToolUse/PostToolUse Hook、实际 `call()` |
-| 权限入口 | `useCanUseTool.tsx` | REPL 注入；headless 由 `print.ts` 注入等价 fn |
-
-### 5.4 权限决策顺序（`hasPermissionsToUseToolInner`）
-
-实现：`src/utils/permissions/permissions.ts`（约 1179 行起）。
+### 12.4 权限决策顺序（`hasPermissionsToUseToolInner`）
 
 | 步骤 | 检查 | 结果 |
 |------|------|------|
-| 1a | 工具级 **deny** 规则 | deny |
-| 1b | 工具级 **ask** 规则 | ask（沙箱 auto-allow bash 可例外） |
-| 1c | **`tool.checkPermissions()`** | 工具自定义（Bash 命令 pattern、路径安全等） |
-| 1d–1g | deny / 强制交互 / 内容 ask / safetyCheck | 即使 bypass 模式也可能 ask |
-| 2a | **`mode === bypassPermissions`**（或 plan+bypass 可用） | allow |
-| 2b | 工具级 **allow** 规则 | allow |
-| 3 | passthrough → **ask** | 弹 UI / classifier |
-| 末尾 | **`dontAsk` 模式** | ask → deny |
-| 末尾 | **`auto` 模式 + classifier** | yoloClassifier 代替人工 |
+| 1a–1g | deny / ask / `tool.checkPermissions()` / safety | deny 或 ask |
+| 2a | `bypassPermissions` mode | allow |
+| 2b | allow 规则 | allow |
+| 3 | passthrough | ask → UI / classifier |
+| 末尾 | `dontAsk` | ask → deny |
 
-Hook 层：`PermissionRequest` / `PreToolUse` 在 UI 或 headless 路径上叠加（`executePermissionRequestHooks`、`hooks.ts`）。
+**白名单 = 规则字符串 + destination**，无独立 `whitelist.json`：
 
-### 5.5 「白名单」在代码里是什么
+| destination | 持久化 |
+|-------------|--------|
+| `userSettings` / `projectSettings` / `localSettings` | 磁盘 |
+| **`session`** | 进程内，重启失效 |
+| `user_temporary` 批准 | 同 session |
+| `user_permanent` 批准 | 写 settings |
 
-没有单独的 `whitelist.json`；**规则字符串 + 来源（destination）** 构成白名单/黑名单：
+**无 wall-clock TTL**；Auto 模式 `DENIAL_LIMITS` 连续 deny 后 fallback 人工。
 
-```json
-// ~/.claude/settings.json 示例
-{
-  "permissions": {
-    "allow": ["Bash(npm run:*)", "Read(./src/**)"],
-    "deny": ["WebFetch"],
-    "ask": ["Bash(git push:*)"]
-  }
-}
-```
+### 12.5 实战
 
-运行时载入为 `ToolPermissionContext`：
+「工具被拦」→ §12.4 顺序表 + 打印 `toolPermissionContext.mode` 与 rules source。
 
-| 字段 | 含义 |
-|------|------|
-| `alwaysAllowRules` | allow 规则，按 source 分组 |
-| `alwaysDenyRules` | deny 规则 |
-| `alwaysAskRules` | ask 规则 |
-| `mode` | `default` / `acceptEdits` / `plan` / `bypassPermissions` / `dontAsk` / `auto` |
-| `additionalWorkingDirectories` | 额外可写目录 |
-
-**规则来源（`PermissionRuleSource`）：**
-
-| source | 持久化 | 典型场景 |
-|--------|--------|----------|
-| `userSettings` | 全局磁盘 | `/login`、用户批准「始终允许」 |
-| `projectSettings` | 项目 `.claude/settings.json` | 团队共享 |
-| `localSettings` | gitignore 本地 | 个人项目覆盖 |
-| **`session`** | **仅内存，会话结束失效** | CLI `--permission-mode`、UI「本次会话允许」 |
-| `cliArg` | 启动参数 | `--allowedTools` 等 |
-| `command` / `policySettings` | 只读 | 企业策略、slash 注入 |
-
-用户在权限 UI 选择：
-
-- **`user_permanent`** → 写入 user/project/local settings（持久白名单）
-- **`user_temporary`** → 写入 **`session` destination**（会话级，非 wall-clock TTL）
-- **`user_reject`** → 拒绝本次
-
-见 `PermissionPromptToolResultSchema.ts`、`permissionLogging.ts`。
-
-### 5.6 「时效限制」在代码里是什么
-
-**当前实现没有「规则 N 小时后过期」的 wall-clock TTL 字段**（`permissions/` 下无 `expiresAt`）。
-
-时效由以下机制表达：
-
-| 机制 | 行为 |
-|------|------|
-| **`destination: session`** | 进程/会话存活期间有效，重启 CLI 失效 |
-| **`user_temporary` 批准** | 同上，不写磁盘 |
-| **`user_permanent` 批准** | 持久到 settings，直到用户删除或 `removeRules` |
-| **Auto 模式 classifier** | `DENIAL_LIMITS`：连续 deny ≥3 或累计 ≥20 次后 **fallback 到人工 prompt**（`denialTracking.ts`） |
-| **Plan 模式 / acceptEdits** | 模式切换改变可写路径与 bypass 语义，非时间 TTL |
-| **Sandbox** | 命令在沙箱内执行，与权限规则正交（`shouldUseSandbox`、`SandboxManager`） |
-
-若产品上要「1 小时有效的 allow」，需要新增规则 schema + `permissionsLoader` 过期逻辑（当前未实现）。
-
-### 5.7 与 settings / Hooks 的关系
-
-| 配置 | Tool harness 作用 |
-|------|-------------------|
-| `permissions.allow/deny/ask` | 载入 `ToolPermissionContext` 规则集 |
-| `permissions.defaultMode` | 初始 `mode` |
-| `hooks.PreToolUse` | 可在工具执行前 block / modify |
-| `hooks.PermissionRequest` | 权限对话框前后注入逻辑 |
-
-复杂 allow 仍推荐走 settings + `updateConfig` skill，而非指望模型记忆。
-
-### 5.8 Test-only 与 §6.3 的关系
-
-`allowBackgroundForkedSlashCommands` 属于 **KAIROS 测试逃生口**，与 permissions 白名单无关；详见 [§6.3](#63-test-onlyallowbackgroundforkedslashcommands)。
+单测：`src/utils/permissions/__tests__/`。
 
 ---
 
-## 6. 关键契约（改之前必读）
+## 13. L9 子 Agent Harness
 
-### 6.1 Deferred autonomy completion
+### 13.1 职责
 
-**问题背景：** KAIROS 等 slash 会 **detach 后台任务** 但立刻从 `processUserInput` 返回。若 harness 马上 `finalizeAutonomyRunCompleted`，调度器会认为 run 已成功，下一 tick 可能叠多个 worker。
+- `AgentTool` / `runForkedAgent` / `runAgent` 启动隔离 query
+- 工具黑名单、独立 querySource、sidechain 持久化
+- Langfuse trace：**子 agent 复用 parent trace**，不重复 create
 
-**契约：**
+### 13.2 Harness 保证
 
-```ts
-// slash 返回
-{ deferAutonomyCompletion: true, ... }
+- `!toolUseContext.agentId` gate：extractMemories、autoDream、CHICAGO_MCP cleanup **仅主线程**
+- 子 agent compact → `postCompactCleanup` 行为与主线程不同（勿污染 parent CLAUDE.md cache）
+- `queryTracking.depth` 递增；过深需产品层限制
 
-// handlePromptSubmit 维护 deferredAutonomyRunIds，跳过这些 run 的 finalize
-// 命令实现必须在后台结束时自行调用 finalizeAutonomyRunCompleted / Failed
-```
+### 13.3 实战
 
-涉及文件：
-
-- `processSlashCommand.tsx`
-- `handlePromptSubmit.ts`
-- `processSlashCommand.test.ts`
-
-### 6.2 Mid-turn queue drain（query.ts）
-
-在 **已有 turn 进行中**，`query.ts` 可能通过 attachment 消费队列里的 autonomy 命令：
-
-```ts
-// query.ts（约 1826+ 行）
-const queuedCommandsSnapshot = getCommandsByMaxPriority(...)
-const queuedAutonomyClaim = await claimConsumableQueuedAutonomyCommands(...)
-```
-
-改 drain 逻辑时必须：
-
-- stale run → `removeFromQueue`，**不要**发给模型
-- consumed run → turn 结束时走 `finalizeAutonomyCommandsForTurn`
-- 不要破坏 `markAutonomyRunRunning` 的 **terminal-safe** 转换（`autonomyRuns.test.ts`）
-
-### 6.3 TEST-ONLY：`allowBackgroundForkedSlashCommands`
-
-`ToolUseContext.options.allowBackgroundForkedSlashCommands`（`src/Tool.ts`）：
-
-- **仅** 单测构造 context 时使用
-- 生产仍要 `feature('KAIROS')` + `AppState.kairosEnabled`
-- `processSlashCommand` 在 `NODE_ENV !== 'test'` 会拒绝此 flag
-
-这是 **non-bundled test harness** 进入 KAIROS fork 路径的逃生口，不是功能开关。
-
-### 6.4 Harness-science / Ablation
-
-`src/entrypoints/cli.tsx` 顶部 `ABLATION_BASELINE`：在 **模块 import 前** 注入 env，因为 BashTool/AgentTool 会在 load 时 capture 常量。改 ablation 要放在 cli 入口，不要放到 `init.ts`。
+改 Agent 工具集 → 同步 `ALL_AGENT_DISALLOWED_TOOLS` 与 `CORE_TOOLS` 策略。
 
 ---
 
-## 7. 配置型 Harness：settings 与 Hooks
+## 14. L10 Turn 收尾 Harness
 
-用户通过 `~/.claude/settings.json`（及项目级 `settings.local.json`）配置 harness 行为，**无需改 TS**：
+### 14.1 职责
 
-| 配置 | Harness 行为 |
-|------|----------------|
-| `hooks` | 27 种事件触发命令 / prompt hook |
-| `permissions` | allow/deny/ask 规则 |
-| `env` | 注入 provider、feature env |
-| `model` / `theme` | 会话默认值 |
+模型产出 final response（无 pending tool）后：
 
-**实战：** “每次 Stop 后执行脚本” → 配 `Stop` hook，不是写 memory。REPL 里可用 `/config` 或 Config 工具；复杂变更用 `updateConfig` skill。
+| 任务 | 模块 | Gate |
+|------|------|------|
+| Stop hooks | `executeStopHooks` | 可 block 继续 |
+| Prompt suggestion | `promptSuggestion` | !bare, !poor |
+| Extract memories | `extractMemories` | §8.5 |
+| Auto dream | `autoDream` | !bare, !poor, 主线程 |
+| CHICAGO MCP cleanup | `cleanupComputerUseAfterTurn` | 主线程 |
 
-Hook 匹配字段（如 `PreToolUse` 的 `tool_name`）见 SDK schema：`src/entrypoints/sdk/coreSchemas.ts`。
+### 14.2 关键文件
+
+- `src/query/stopHooks.ts` — `handleStopHooks`
+- `src/utils/gracefulShutdown.ts` — 进程退出
+- `cli/print.ts` — `drainPendingExtraction`
+
+### 14.3 实战
+
+Headless 脚本过早 exit → 丢 extractMemories；需等 drain。
 
 ---
 
-## 8. 测试 Harness：怎么验证你的改动
+## 15. L11 输出与 Side-Channel Harness
 
-### 8.1 单元测试（in-process harness）
+### 15.1 职责
 
-**模板：** `src/__tests__/handlePromptSubmit.test.ts`
+- **Claude Code Hints**：Bash 输出中 `<claude-code-hint />` 被 harness **剥掉**再给模型；UI 可展示 install 提示（`claudeCodeHints.ts`）
+- **Headless**：`structuredIO.ts` control 协议、elicitation
+- **REPL**：Ink 渲染与权限对话框
+
+### 15.2 Invariant
+
+Side-channel 内容**不得**进入 model-visible messages，除非显式 attachment 设计。
+
+---
+
+## 16. L12 可观测性 Harness
+
+### 16.1 职责
+
+| 能力 | 文件 / 机制 |
+|------|-------------|
+| Langfuse trace | `query.ts` create/end/flush |
+| Query profiling | `queryCheckpoint`、`startQueryProfile` |
+| Workload | `runWithWorkload`（`handlePromptSubmit`） |
+| Analytics | `logEvent('tengu_*')` |
+| Eval 确定性 | `growthbook.ts` env override（eval harness） |
+
+### 16.2 实战
+
+性能回归：对照 `queryCheckpoint` 名称；F5 调试见 vscode 文档。
+
+---
+
+# Part III — 横切能力
+
+## 17. 配置型 Harness：Settings 与 Hooks
+
+用户通过 settings **无需改 TS** 扩展 harness：
+
+| 配置 | 作用层 |
+|------|--------|
+| `hooks`（27 事件） | L2、L8、L10 |
+| `permissions` | L8 |
+| `env` | L0、L6 provider |
+| `autoMemoryEnabled` | L4 |
+
+Hook 引擎：`executeHooks`（`src/utils/hooks.ts`）；schema：`src/entrypoints/sdk/coreSchemas.ts`。
+
+`CLAUDE_CODE_SIMPLE=1` 关闭 Hook。非 trusted workspace skip。
+
+**实战：** 「每次 Stop 跑脚本」→ 配 `Stop` hook，不是写 memory。
+
+---
+
+## 18. 关键契约（改之前必读）
+
+### 18.1 Deferred autonomy completion
 
 ```ts
-// 最小参数面
-await handlePromptSubmit({
-  input: 'hello',
-  mode: 'prompt',
-  queryGuard: new QueryGuard(),
-  helpers: { setCursorOffset, clearBuffer, resetHistory },
-  onQuery: mock(...),
-  getToolUseContext: mock(...),
-  // ...
-})
+{ deferAutonomyCompletion: true }  // slash 返回
+// handlePromptSubmit 跳过 finalize → 后台自行 finalize
 ```
 
-要点：
+文件：`processSlashCommand.tsx`、`handlePromptSubmit.ts`。
 
-- 用 `tests/mocks/log.ts`、`tests/mocks/debug.ts` **共享 mock**
-- **不要** mock 被测业务模块的上层（避免 `mock.module` 污染同目录其他测试）
-- autonomy 相关：`createAutonomyQueuedPrompt`、`resetCommandQueue`
+### 18.2 Mid-turn queue drain
 
-### 8.2 Slash / deferred completion 测试
+`query.ts` → `claimConsumableQueuedAutonomyCommands`：stale → remove；consumed → turn 结束 finalize。
 
-`src/utils/processUserInput/__tests__/processSlashCommand.test.ts`（若存在）及 `sur-loop-scheduled-oom.md` 中的清单：
+### 18.3 TEST-ONLY：`allowBackgroundForkedSlashCommands`
+
+仅 `NODE_ENV=test` + 单测构造 `ToolUseContext`；生产无效。见 `src/Tool.ts`。
+
+### 18.4 Harness-science / Ablation
+
+env 注入在 `cli.tsx` import 前，不在 `init.ts`。
+
+---
+
+## 19. 测试 Harness
+
+### 19.1 单元测试（in-process）
+
+模板：`src/__tests__/handlePromptSubmit.test.ts`
+
+- 共享 mock：`tests/mocks/log.ts`、`debug.ts`
+- **勿** mock 被测业务模块上层（Bun `mock.module` 进程全局污染）
+- autonomy：`createAutonomyQueuedPrompt`、`resetCommandQueue`
+
+### 19.2 Deferred completion 测试
 
 1. `allowBackgroundForkedSlashCommands: true` + `NODE_ENV=test`
-2. 断言 `deferAutonomyCompletion` 时 **handlePromptSubmit 不 finalize**
-3. 后台结束后命令自行 finalize
+2. `deferAutonomyCompletion` 时 assert **不** finalize
+3. 后台结束后自行 finalize
 
-### 8.3 集成测试（subprocess harness）
+### 19.3 集成测试（subprocess）
 
 `tests/integration/autonomy-lifecycle-user-flow.test.ts`：
 
-- 用 **`dist/cli.js`** 子进程，不用 `src/entrypoints/cli.tsx`（cwd 下 path alias 会炸）
-- CI 可能尚未 build → `beforeAll` 里 lazy `bun run build`
-- 隔离 config：`CLAUDE_CONFIG_DIR` 指向 temp dir
+- 用 **`dist/cli.js`**，非 `src/entrypoints/cli.tsx`
+- `CLAUDE_CONFIG_DIR` → temp dir
 
-**何时用集成测：** 跨进程、持久化 autonomy run、真实 CLI argv。
+### 19.4 Eval harness
 
-### 8.4 Eval harness（GrowthBook）
+GrowthBook env override 保证 eval 分组确定性。
 
-`growthbook.ts` 多处注释 **“for eval harnesses”**：
-
-- 环境变量覆盖远程分组，保证 eval **确定性**
-- 写 eval 脚本时优先 env override，而不是改生产默认
-
-### 8.5 测试命令
+### 19.5 命令
 
 ```bash
 bun test src/__tests__/handlePromptSubmit.test.ts
 bun test src/utils/__tests__/autonomyRuns.test.ts
 bun test tests/integration/autonomy-lifecycle-user-flow.test.ts
-bun run precheck   # 提交前
+bun run precheck
 ```
 
 ---
 
-## 9. 实战场景 walkthrough
+## 20. 调试与排错索引
 
-### 场景 A：用户提交被 Hook 拦截
-
-1. 在 `processUserInput` 找 `getUserPromptSubmitHookBlockingMessage`
-2. 跟 `executeUserPromptSubmitHooks` → `executeHooks`
-3. 本地复现：在 `settings.json` 加 `UserPromptSubmit` hook 打 log
-4. 单测：mock `hooks.js` 返回 blocking message，断言 `shouldQuery === false`
-
-### 场景 B：Autonomy 任务卡在 queued
-
-1. `listAutonomyRuns()` / `listAutonomyFlows()` 看磁盘状态（项目 `.claude` 或 config dir）
-2. 查是否只走了 `query.ts` mid-turn drain 却 **没 finalize**（AUT-001 类 bug）
-3. 查 run 是否已被 cancel  yet  stale command 又 `markAutonomyRunRunning`
-4. 跑 `autonomyRuns.test.ts` + 集成测
-
-### 场景 C：Slash 命令后台跑但调度器狂叠 tick
-
-1. 确认是否应设 `deferAutonomyCompletion: true`
-2. 读 `handlePromptSubmit` 里 `deferredAutonomyRunIds`
-3. 用 test harness flag 写回归测（§7.2）
-
-### 场景 D：Headless pipe 与 REPL 行为不一致
-
-1. 对比 `REPL.tsx` 与 `cli/print.ts` 传给 `processUserInput` / `onQuery` 的参数
-2. 检查 `skipSlashCommands`、`bridgeOrigin`、`querySource`
-3. 管道验证：`echo "..." | bun run dev -p`
-
-### 场景 E：新增 Hook 事件或改 schema
-
-1. 改 `coreSchemas.ts` → `bun scripts/generate-sdk-types.ts`
-2. 在 `hooks.ts` 注册匹配逻辑
-3. 更新 `docs/extensibility/hooks.mdx`
-
-### 场景 F：改 query turn 内队列优先级
-
-1. `messageQueueManager.getCommandsByMaxPriority`
-2. `query.ts` attachment 合并逻辑
-3. 回归：`handlePromptSubmit.test.ts` + 手动 REPL 连发两条消息
-
-### 场景 G：工具被 deny / 白名单不生效
-
-1. 读 `hasPermissionsToUseToolInner` 决策顺序（§5.4）——是 deny 规则、mode、还是 `tool.checkPermissions`
-2. 打印 `appState.toolPermissionContext` 的 `alwaysAllowRules` / `mode`
-3. 确认用户批准写的是 `session` 还是 `userSettings`（§5.5–§5.6）
-4. Bash 类工具跟 `bashPermissions.ts` + `shellRuleMatching.ts`
-5. 单测：`src/utils/permissions/__tests__/` 下对应用例
-
----
-
-## 10. 调试与排错
-
-| 目标 | 做法 |
-|------|------|
-| 跟 prompt-submit | F5 attach → `handlePromptSubmit` / `executeUserInput` 断点（见 [vscode-f5-debugging.md](vscode-f5-debugging.md)） |
-| 跟 API turn | `query.ts` 的 `queryLoop` |
-| 看 Hook 是否执行 | `DEBUG=1` / `logForDebugging`；或 Hook 脚本 stdout |
-| Autonomy 状态 | 日志 + `listAutonomyRuns`；集成测 temp config dir |
-| 排队问题 | `getCommandQueue()` 在测里断言；REPL 看 queue UI |
-| 工具权限 | `hasPermissionsToUseTool` 断点；查 settings `permissions` 与 `mode`（§5） |
+| 目标 | 层 | 做法 |
+|------|-----|------|
+| 提交 / 排队 | L2 | F5 → `handlePromptSubmit`；`getCommandQueue()` |
+| 上下文 / 压缩 | L3/L7 | `queryLoop` checkpoint；`autoCompact.ts` |
+| Memory | L4 | `stopHooks`；memdir；prefetch telemetry |
+| Autonomy stuck | L5 | `listAutonomyRuns`；finalize 双路径 |
+| API / tool loop | L6/L8 | `queryLoop`；`hasPermissionsToUseTool` |
+| Hook 未跑 | L17 | trusted workspace；`CLAUDE_CODE_SIMPLE` |
+| Headless 不一致 | L3 | 对比 `REPL.tsx` vs `print.ts` 参数 |
 
 **常见误判：**
 
-- 只改了 REPL 路径，headless 未改 → 线上 pipe/CI 仍坏
-- 在 `bun run dev` 子进程里断点 query → 应改 F5 同进程
-- 单测通过、集成失败 → 检查是否用了 `dist/cli.js` 与 config 隔离
+- 只改 REPL 未改 headless
+- `bun run dev` 子进程断点打不中 → 用 `dev-cli.ts` 同进程
+- 单测通过、集成失败 → 是否用 `dist/cli.js`
 
 ---
 
-## 11. 延伸阅读
+# Part IV — 实战手册
+
+## 21. 场景 Playbook（按症状）
+
+| # | 症状 | 层 | 第一步 |
+|---|------|-----|--------|
+| A | 提交被 Hook 拦截 | L2/L17 | `executeUserPromptSubmitHooks` |
+| B | Autonomy 卡 queued | L5 | `listAutonomyRuns` + finalize 双路径 |
+| C | 调度器叠 tick | L5 | `deferAutonomyCompletion` |
+| D | REPL vs pipe 不一致 | L2/L3 | 对比 `print.ts` 参数 |
+| E | 新 Hook 事件 | L17 | `coreSchemas.ts` → generate-sdk-types |
+| F | 队列优先级错 | L2/L5 | `getCommandsByMaxPriority` |
+| G | 工具 deny | L8 | §12.4 决策顺序 |
+| H | 突然 autocompact | L7 | `query_autocompact_*` + env 窗口 |
+| I | Memory 未写入 | L4 | §8.2–8.5 gate 链 |
+| J | CLAUDE.md stale | L3 | memoize cache / compact cleanup |
+| K | 子 agent 行为异常 | L9 | agentId gate + 工具黑名单 |
+
+### 场景 A 详解：Hook 拦截
+
+1. `processUserInput` → `getUserPromptSubmitHookBlockingMessage`
+2. settings 加 `UserPromptSubmit` hook 打 log 复现
+3. mock hooks 返回 blocking → `shouldQuery === false`
+
+### 场景 G 详解：权限
+
+1. `hasPermissionsToUseToolInner` 顺序（§12.4）
+2. `appState.toolPermissionContext` → mode + rules source
+3. Bash → `bashPermissions.ts` + `shellRuleMatching.ts`
+
+---
+
+## 22. 改代码检查清单（按层）
+
+| 改动涉及 | 必查 |
+|----------|------|
+| L2 排队 | REPL + `print.ts` + 单测 |
+| L3 context | memoize invalidation；headless 传参 |
+| L4 memory | feature + poor + bare 双 gate；filesystem internal paths |
+| L5 autonomy | 两个 finalize 入口；deferred completion |
+| L6 query | `finally` autonomy + Langfuse flush |
+| L7 compact | `snipTokensFreed`；postCompact cleanup |
+| L8 权限 | REPL UI + headless `canUseTool` + hooks |
+| L9 agent | 主线程 gate；trace 归属 |
+| L10 stop | drain pending extraction（headless） |
+
+---
+
+## 23. 延伸阅读
 
 | 文档 | 内容 |
 |------|------|
-| [practical-handbook.md](practical-handbook.md) | 源码开发总手册 |
-| [vscode-f5-debugging.md](vscode-f5-debugging.md) | F5 断点调试 |
-| [internals/autonomy-jira.md](internals/autonomy-jira.md) | Autonomy 生命周期审计与 AC |
-| [agent/sur-loop-scheduled-oom.md](agent/sur-loop-scheduled-oom.md) | Deferred completion、KAIROS harness 设计 |
+| [practical-handbook.md](practical-handbook.md) | 环境、命令、代码地图 |
+| [vscode-f5-debugging.md](vscode-f5-debugging.md) | F5 断点 |
+| [internals/autonomy-jira.md](internals/autonomy-jira.md) | Autonomy AC |
+| [agent/sur-loop-scheduled-oom.md](agent/sur-loop-scheduled-oom.md) | KAIROS / deferred completion |
 | [extensibility/hooks.mdx](extensibility/hooks.mdx) | Hook 协议 |
-| [test-plans/openclaw-autonomy-baseline.md](test-plans/openclaw-autonomy-baseline.md) | 高成本 harness 测试范围 |
 
 ---
 
-**维护：** 修改 `handlePromptSubmit`、`query.ts` autonomy 消费、`autonomyRuns` 状态机、**工具权限/执行管道**或 Hook 执行语义时，请同步更新本文 §5–§6 与 §9 场景。
+**维护：** 修改任一层 Harness（L0–L12）或 §18 契约时，请同步更新对应章节与 §21 Playbook。架构分层变更时先改 §1.3 与 §2 生命周期图。

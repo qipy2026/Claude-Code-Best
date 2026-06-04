@@ -436,7 +436,7 @@ bun run health
 | [README.md](../README.md) | 项目介绍、快速开始 |
 | [CLAUDE.md](../CLAUDE.md) | AI Agent 工作区规范（架构、测试、Feature Flag） |
 | [本手册](practical-handbook.md) | 源码开发实战 |
-| [**Harness 实战指导**](harness-practical-guide.md) | 运行时编排层：调用链、契约、测试 harness |
+| [**Harness 实战指导**](harness-practical-guide.md) | 生产级智能体 L0–L12 Harness 分层、生命周期、Playbook |
 | [VS Code 断点调试](vscode-f5-debugging.md) | F5 / attach 详细步骤 |
 | [全功能指南](features/all-features-guide.md) | 各 Feature 用法 |
 | [在线文档](https://ccb.agent-aura.top/) | Mintlify 站点 |

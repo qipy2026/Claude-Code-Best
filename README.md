@@ -37,7 +37,7 @@
 - 🐛 [想要调试项目](#vs-code--cursor-断点调试)
 - 📖 [想要学习项目](#teach-me-学习项目)
 - 📘 **[实战手册（源码开发）](docs/practical-handbook.md)** — 环境、API、调试、改代码地图、故障排查
-- 🔧 **[Harness 实战指导](docs/harness-practical-guide.md)** — 运行时编排层、调用链、契约、测试 harness
+- 🔧 **[Harness 实战指导](docs/harness-practical-guide.md)** — 生产级智能体 L0–L12 分层 Harness、端到端生命周期、场景 Playbook
 
 ## ⚡ 快速开始(安装版)
 
@@ -214,7 +214,7 @@ TUI (REPL) 需真实终端，请用 **Bun 扩展 + attach 模式** 调试 `src/q
 
 ## 相关文档及网站
 
-- **Harness 实战指导**: [`docs/harness-practical-guide.md`](docs/harness-practical-guide.md) — 运行时编排、autonomy 契约、Hook、测试 harness
+- **Harness 实战指导**: [`docs/harness-practical-guide.md`](docs/harness-practical-guide.md) — L0–L12 分层架构、各层 Harness 方案与实战手册
 - **实战手册（源码开发）**: [`docs/practical-handbook.md`](docs/practical-handbook.md) — 日常开发、API 配置、断点调试、代码地图
 - **在线文档（Mintlify）**: [ccb.agent-aura.top](https://ccb.agent-aura.top/) — 文档源码位于 [`docs/`](docs/) 目录，欢迎投稿 PR
 - **DeepWiki**: [https://deepwiki.com/claude-code-best/claude-code](https://deepwiki.com/claude-code-best/claude-code)
