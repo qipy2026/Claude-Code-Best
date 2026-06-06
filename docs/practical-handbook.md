@@ -1,6 +1,6 @@
 # Claude Code Best 实战手册
 
-面向**源码贡献者**与**二次开发者**的实操指南：从环境搭建、日常开发、API 配置、断点调试，到改代码时该看哪些文件。功能特性的详细说明见 [`docs/features/`](features/) 与 [在线文档](https://ccb.agent-aura.top/)。
+面向**源码贡献者**与**二次开发者**的实操指南：从环境搭建、日常开发、API 配置、断点调试，到改代码时该看哪些文件。功能特性的详细说明见 `[docs/features/](features/)` 与 [在线文档](https://ccb.agent-aura.top/)。
 
 ---
 
@@ -26,11 +26,13 @@
 
 ### 环境要求
 
-| 项目 | 要求 |
-|------|------|
-| 运行时 | **Bun ≥ 1.3.11**（建议 `bun upgrade` 到最新） |
-| 操作系统 | Windows / macOS / Linux |
-| 工作目录 | 仓库根目录（含 `package.json`） |
+
+| 项目   | 要求                                     |
+| ---- | -------------------------------------- |
+| 运行时  | **Bun ≥ 1.3.11**（建议 `bun upgrade` 到最新） |
+| 操作系统 | Windows / macOS / Linux                |
+| 工作目录 | 仓库根目录（含 `package.json`）                |
+
 
 ```bash
 # 安装 Bun（Windows PowerShell）
@@ -70,10 +72,12 @@ echo "Reply with exactly: OK" | bun run dev -p --model <模型名>
 
 配置持久化路径：
 
-| 平台 | 路径 |
-|------|------|
-| Windows | `%USERPROFILE%\.claude\settings.json` |
-| macOS / Linux | `~/.claude/settings.json` |
+
+| 平台            | 路径                                    |
+| ------------- | ------------------------------------- |
+| Windows       | `%USERPROFILE%\.claude\settings.json` |
+| macOS / Linux | `~/.claude/settings.json`             |
+
 
 也可直接编辑 `settings.json` 的 `env` 字段注入环境变量（见 [§3](#3-模型与-api-配置)）。
 
@@ -83,15 +87,17 @@ echo "Reply with exactly: OK" | bun run dev -p --model <模型名>
 
 ### 命令对照
 
-| 目的 | 命令 |
-|------|------|
-| 终端开发（子进程） | `bun run dev` |
-| 带 inspect 同进程 | `bun run dev:inspect` |
-| F5 调试验证路径 | `bun run verify:f5` |
-| 重新生成 launch 配置 | `bun run generate:launch` |
-| 改完代码全量检查 | `bun run precheck` |
-| 仅类型检查 | `bun run typecheck` |
-| 单文件测试 | `bun test src/utils/__tests__/hash.test.ts` |
+
+| 目的             | 命令                                          |
+| -------------- | ------------------------------------------- |
+| 终端开发（子进程）      | `bun run dev`                               |
+| 带 inspect 同进程  | `bun run dev:inspect`                       |
+| F5 调试验证路径      | `bun run verify:f5`                         |
+| 重新生成 launch 配置 | `bun run generate:launch`                   |
+| 改完代码全量检查       | `bun run precheck`                          |
+| 仅类型检查          | `bun run typecheck`                         |
+| 单文件测试          | `bun test src/utils/__tests__/hash.test.ts` |
+
 
 ### 进程模型（必读）
 
@@ -120,13 +126,15 @@ bun run precheck
 
 ### 项目内 REPL 常用命令
 
-| 命令 | 说明 |
-|------|------|
-| `/login` | 配置 API 提供商 |
-| `/poor` | 穷鬼模式（省 token，关记忆提取等） |
-| `/model` | 切换模型 |
-| `/doctor` | 环境诊断 |
-| `/teach-me <主题>` | 交互式学习项目模块 |
+
+| 命令               | 说明                   |
+| ---------------- | -------------------- |
+| `/login`         | 配置 API 提供商           |
+| `/poor`          | 穷鬼模式（省 token，关记忆提取等） |
+| `/model`         | 切换模型                 |
+| `/doctor`        | 环境诊断                 |
+| `/teach-me <主题>` | 交互式学习项目模块            |
+
 
 ---
 
@@ -156,13 +164,15 @@ echo "Reply with exactly: API_OK" | bun run dev -p --model deepseek-v4-flash
 
 ### 3.2 多 Provider 环境变量
 
-| Provider | 启用变量 | 关键配置 |
-|----------|----------|----------|
-| Anthropic 直连 | （默认） | `ANTHROPIC_API_KEY` |
-| OpenAI 兼容 | `CLAUDE_CODE_USE_OPENAI=1` | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` |
-| Gemini | `CLAUDE_CODE_USE_GEMINI=1` | `GEMINI_API_KEY`, `GEMINI_MODEL` |
-| Grok | `CLAUDE_CODE_USE_GROK=1` | Grok 相关 env |
-| Bedrock / Vertex / Foundry | 各自 `CLAUDE_CODE_USE_*=1` | 见 `src/utils/model/providers.ts` |
+
+| Provider                   | 启用变量                       | 关键配置                                                |
+| -------------------------- | -------------------------- | --------------------------------------------------- |
+| Anthropic 直连               | （默认）                       | `ANTHROPIC_API_KEY`                                 |
+| OpenAI 兼容                  | `CLAUDE_CODE_USE_OPENAI=1` | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` |
+| Gemini                     | `CLAUDE_CODE_USE_GEMINI=1` | `GEMINI_API_KEY`, `GEMINI_MODEL`                    |
+| Grok                       | `CLAUDE_CODE_USE_GROK=1`   | Grok 相关 env                                         |
+| Bedrock / Vertex / Foundry | 各自 `CLAUDE_CODE_USE_*=1`   | 见 `src/utils/model/providers.ts`                    |
+
 
 Provider 优先级：**参数 modelType > 环境变量 > 默认 firstParty**。
 
@@ -283,12 +293,14 @@ FEATURE_DAEMON=1 bun run dev
 FEATURE_BUDDY=1 FEATURE_ACP=1 bun run dev
 ```
 
-| 类别 | 示例 Flag |
-|------|-----------|
-| 基础 | `BUDDY`, `BRIDGE_MODE`, `VOICE_MODE`, `ACP` |
-| Agent | `AGENT_TRIGGERS`, `ULTRATHINK`, `VERIFICATION_AGENT` |
-| 工作流 | `WORKFLOW_SCRIPTS`, `KAIROS`, `COORDINATOR_MODE` |
-| 实验 | `EXPERIMENTAL_SKILL_SEARCH`, `EXPERIMENTAL_SEARCH_EXTRA_TOOLS` |
+
+| 类别    | 示例 Flag                                                        |
+| ----- | -------------------------------------------------------------- |
+| 基础    | `BUDDY`, `BRIDGE_MODE`, `VOICE_MODE`, `ACP`                    |
+| Agent | `AGENT_TRIGGERS`, `ULTRATHINK`, `VERIFICATION_AGENT`           |
+| 工作流   | `WORKFLOW_SCRIPTS`, `KAIROS`, `COORDINATOR_MODE`               |
+| 实验    | `EXPERIMENTAL_SKILL_SEARCH`, `EXPERIMENTAL_SEARCH_EXTRA_TOOLS` |
+
 
 完整列表与功能说明：[docs/features/all-features-guide.md](features/all-features-guide.md)
 
@@ -345,7 +357,7 @@ bun run rcs    # 启动 Remote Control Server + Web UI
 - 集成测试：`tests/integration/`
 - **只 mock 有副作用的链**（`log.ts`、`debug.ts`、`bun:bundle`、网络库等）
 - 共享 mock：`tests/mocks/log.ts`、`tests/mocks/debug.ts`
-- **`mock.module` 是进程全局的** — 同目录 `launch*.test.ts` 应 mock axios 而非业务 API 模块
+- `**mock.module` 是进程全局的** — 同目录 `launch*.test.ts` 应 mock axios 而非业务 API 模块
 
 ```bash
 bun test                              # 全量
@@ -385,16 +397,18 @@ Pre-commit 会跑 lint-staged（Biome）。Windows 需保证 `node` / `npx` 在 
 
 ## 11. 故障排查
 
-| 现象 | 处理 |
-|------|------|
-| `bun: command not found` | 重启终端；确认 `~/.bun/bin` 在 PATH；Windows 可用绝对路径 `%USERPROFILE%\.bun\bin\bun.exe` |
-| `bun run dev` 版本不对 | 确认在仓库根目录；`bun upgrade` |
-| API 401 / 连接失败 | 检查 `~/.claude/settings.json`；`/doctor`；管道 `-p` 测单轮 |
-| F5 断点不命中 | 勿用 `bun run dev` 调试；用 attach 配置，见 [vscode-f5-debugging.md](vscode-f5-debugging.md) |
-| precheck 类型错误 | `bun run typecheck` 定位；scripts 下避免直接 `globalThis.MACRO`，用类型断言 |
-| `production is not defined` | F5 配置勿用 `-d NODE_ENV`；用 `dev-cli.ts` + env |
-| 测试偶发失败 | 怀疑 `mock.module` 污染；单独跑可疑文件定位 |
-| 构建后 RSS 过高 | 确认 code splitting 开启（见 CLAUDE.md 架构说明） |
+
+| 现象                          | 处理                                                                                 |
+| --------------------------- | ---------------------------------------------------------------------------------- |
+| `bun: command not found`    | 重启终端；确认 `~/.bun/bin` 在 PATH；Windows 可用绝对路径 `%USERPROFILE%\.bun\bin\bun.exe`        |
+| `bun run dev` 版本不对          | 确认在仓库根目录；`bun upgrade`                                                             |
+| API 401 / 连接失败              | 检查 `~/.claude/settings.json`；`/doctor`；管道 `-p` 测单轮                                 |
+| F5 断点不命中                    | 勿用 `bun run dev` 调试；用 attach 配置，见 [vscode-f5-debugging.md](vscode-f5-debugging.md) |
+| precheck 类型错误               | `bun run typecheck` 定位；scripts 下避免直接 `globalThis.MACRO`，用类型断言                      |
+| `production is not defined` | F5 配置勿用 `-d NODE_ENV`；用 `dev-cli.ts` + env                                         |
+| 测试偶发失败                      | 怀疑 `mock.module` 污染；单独跑可疑文件定位                                                      |
+| 构建后 RSS 过高                  | 确认 code splitting 开启（见 CLAUDE.md 架构说明）                                             |
+
 
 ---
 
@@ -431,15 +445,17 @@ bun run health
 
 ## 附录：文档索引
 
-| 文档 | 内容 |
-|------|------|
-| [README.md](../README.md) | 项目介绍、快速开始 |
-| [CLAUDE.md](../CLAUDE.md) | AI Agent 工作区规范（架构、测试、Feature Flag） |
-| [本手册](practical-handbook.md) | 源码开发实战 |
-| [**Harness 实战指导**](harness-practical-guide.md) | 生产级智能体 L0–L12 Harness 分层、生命周期、Playbook |
-| [VS Code 断点调试](vscode-f5-debugging.md) | F5 / attach 详细步骤 |
-| [全功能指南](features/all-features-guide.md) | 各 Feature 用法 |
-| [在线文档](https://ccb.agent-aura.top/) | Mintlify 站点 |
+
+| 文档                                             | 内容                                     |
+| ---------------------------------------------- | -------------------------------------- |
+| [README.md](../README.md)                      | 项目介绍、快速开始                              |
+| [CLAUDE.md](../CLAUDE.md)                      | AI Agent 工作区规范（架构、测试、Feature Flag）     |
+| [本手册](practical-handbook.md)                   | 源码开发实战                                 |
+| **[Harness 实战指导](harness-practical-guide.md)** | 生产级智能体 L0–L12 Harness 分层、生命周期、Playbook |
+| [VS Code 断点调试](vscode-f5-debugging.md)         | F5 / attach 详细步骤                       |
+| [全功能指南](features/all-features-guide.md)        | 各 Feature 用法                           |
+| [在线文档](https://ccb.agent-aura.top/)            | Mintlify 站点                            |
+
 
 ---
 

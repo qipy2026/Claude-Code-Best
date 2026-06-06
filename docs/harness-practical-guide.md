@@ -11,8 +11,11 @@
 **Part I — 架构总览**
 
 1. [设计原则与分层模型](#1-设计原则与分层模型)
+   - [1.4 十二层核心特性速览](#14-十二层核心特性速览)
 2. [端到端生命周期](#2-端到端生命周期)
+   - [2.1 生命周期：五段式与层对应](#21-生命周期五段式与层对应)
 3. [运行时形态（REPL / Headless / ACP）](#3-运行时形态repl--headless--acp)
+   - [3.1 三入口：同一 Harness，不同 I/O 壳](#31-三入口同一-harness不同-io-壳)
 
 **Part II — 各层 Harness 方案（按生产链路顺序）**
 
@@ -20,6 +23,7 @@
 5. [L1 会话状态 Harness](#5-l1-会话状态-harness)
 6. [L2 输入摄取 Harness](#6-l2-输入摄取-harness)
 7. [L3 上下文与 Prompt Harness](#7-l3-上下文与-prompt-harness)
+   - [7.8 长对话：意图识别与关键信息传递](#78-长对话意图识别与关键信息传递)
 8. [L4 记忆 Harness](#8-l4-记忆-harness)
 9. [L5 调度与 Autonomy Harness](#9-l5-调度与-autonomy-harness)
 10. [L6 推理循环 Harness（Query / API）](#10-l6-推理循环-harnessquery--api)
@@ -124,6 +128,28 @@ flowchart TB
 
 **横切：** §17 Settings/Hooks、§18 契约、§19 测试——作用于多层。
 
+### 1.4 十二层核心特性速览
+
+读任意一层细节前，先用下表建立「**这层保证什么、不保证什么**」的心智模型。详细机制与案例见各层 **§X.0 核心特性** 与 Part IV §21。
+
+| 层 | Harness 回答的核心问题 | 关键不变量（每当 X → Y） | 常见误区 | 一条例子 |
+|----|----------------------|--------------------------|----------|----------|
+| **L0** | 进程如何以正确 capability 启动 | 快速路径 → 最小 import；ablation env → **早于**工具模块 load | 以为 runtime env 能打开 build 已 tree-shake 的 feature | `--version` 瞬时返回，REPL 慢路径加载完整 harness |
+| **L1** | 「这是哪次会话、在哪个目录」 | `sessionId` 进程内稳定；改 CWD → 同步 permission working dirs | 在 React state 里另存 session 路径，与 bootstrap 单例不一致 | `/resume` 后 memdir 写到 `getProjectDir(cwd)` 下 |
+| **L2** | 用户输入如何不丢、不并发乱序 | 同时仅 1 个 in-flight query；连发 → 入队 → turn 结束 dequeue | 模型还在跑时以为新输入一定排队（不可 interrupt 工具时会阻塞） | 连发三条 Enter，三条都执行，顺序 harness 保证 |
+| **L3** | 模型窗口里装什么 context | UI 保留 full transcript；API 只看 slice + 注入；超窗 → **代码** pipeline 丢/留 | 让模型自己决定删历史；把 UI 历史当 API 视图 | `/context` 看到的比聊天面板短 |
+| **L4** | 跨轮/跨 session 知识如何外化再拉回 | 大段知识 → 磁盘；进窗口 → prefetch/索引，有 cap | 把 MEMORY.md 当无限 system prompt；extract 当同步阻塞 | turn 结束 extract 写 sidecar，下轮 prefetch 注入 |
+| **L5** | 谁触发下一轮 work | cron/HEARTBEAT → **入队** QueuedCommand，非模型 self-schedule | mid-turn drain 与 turn 结束 finalize 不一致 → stuck | KAIROS 后台需 `deferAutonomyCompletion` |
+| **L6** | 一次 user turn 内 API↔工具如何循环 | 每 iteration 先 L7 再 callModel；`query()` finally 必 cleanup | 在 `claude.ts` 里加压缩或 autonomy 逻辑 | tool loop 10 次后 stopHook block 续跑 |
+| **L7** | token 满了丢什么、留什么 | pipeline 顺序固定（§7.4）；SM compact 优先于 full compact | 改 microcompact 未传 `snipTokensFreed` → 阈值误判 | 对话中途变 summary → autocompact 触发 |
+| **L8** | 模型 tool_use 能否变成副作用 | deny > allow；hook 可改 input；子 agent 有黑名单 | 以为用户点过一次 allow 就永久全局生效（session 级会重启失效） | deny 规则挡掉已 session-allow 的 bash |
+| **L9** | 子 agent 与主线程如何隔离 | `agentId` gate 主线程-only 任务；子 compact 不清 parent cache | 子 agent 拥有与主 agent 相同工具集 | extractMemories 仅 `!agentId` |
+| **L10** | turn「表面结束」后还要做什么 | 无 pending tool → stopHooks；extract 异步；headless 需 drain | pipe 脚本 exit 早于 extract promise | `-p` 模式 memdir 空 → 未 drain |
+| **L11** | 什么给 UI、什么给模型 | hint / structuredIO **默认**不进 model-visible | UI 底部 install 提示 ≠ 模型已知 | 模型说「无法安装 plugin」但 UI 有 hint 条 |
+| **L12** | 如何观测而不改变语义 | trace end/flush 在 finally；eval 用 env 固定分组 | Langfuse span 泄漏当成功（RSS 涨） | F5 用 checkpoint 对比 snip vs API 耗时 |
+
+**读法建议：** Part II 按 L0→L12 顺序改代码；Part IV §22 按**症状**反查层。
+
 ---
 
 ## 2. 端到端生命周期
@@ -165,6 +191,20 @@ sequenceDiagram
 | 会话编排 | `QueryEngine` | `src/QueryEngine.ts` |
 | 单次 API | `queryModelWithStreaming` | `src/services/api/claude.ts` |
 
+### 2.1 生命周期：五段式与层对应
+
+用户一次 Enter 在 Harness 眼里是五段，**段边界即调试断点**：
+
+| 段 | 做什么 | 主要层 | 典型断点 / 日志 |
+|----|--------|--------|-----------------|
+| **① 摄取** | 互斥、Hook、slash、入队 | L0–L2 | `handlePromptSubmit`、`QueryGuard` |
+| **② 组装** | attachments、user context、prefetch | L3–L4 | `processUserInput`、`getAttachmentMessages` |
+| **③ 循环** | 压缩 → API → 工具 → 再压缩 | L6–L8、L7 | `queryLoop`、`query_snip_start` |
+| **④ 分支** | 子 agent fork | L9 | `runForkedAgent` |
+| **⑤ 收尾** | stopHooks、extract、autonomy finalize | L5、L10 | `stopHooks.ts`、`finalizeAutonomyCommandsForTurn` |
+
+**Invariant：** ② 只在 user turn 开始时跑全量 attachment；③ 每个 **queryLoop iteration** 都重跑 L7，因 tool result 会撑 token。
+
 ---
 
 ## 3. 运行时形态（REPL / Headless / ACP）
@@ -180,11 +220,36 @@ sequenceDiagram
 
 **Invariant：** 改 `handlePromptSubmit` 或 `query.ts` 的 autonomy / 队列逻辑时，**必须对称检查** `print.ts`（见 `docs/internals/autonomy-jira.md`）。
 
+### 3.1 三入口：同一 Harness，不同 I/O 壳
+
+| 能力 | REPL | Headless (`print.ts`) | ACP |
+|------|------|----------------------|-----|
+| 用户输入 | Ink `PromptInput` | stdin / structuredIO | ACP session |
+| 权限 ask | Ink 对话框 | elicitation / `--permission-mode` | `createAcpCanUseTool` |
+| 排队可视化 | UI 队列条 | 无（逻辑仍在） | 依客户端 |
+| extract drain | REPL shutdown | **`drainPendingExtraction` 必调** | 同 REPL 路径 |
+| 集成测基准 | 可选 | **`dist/cli.js` 子进程** | — |
+
+**核心特性：** 业务 invariant（L2 排队、L5 finalize、L8 权限序）在三种入口**必须一致**；差异只在 **I/O 呈现**。改 REPL 未改 `print.ts` 是最高频的生产 bug 类（→ Playbook D）。
+
 ---
 
 # Part II — 各层 Harness 方案
 
+每层统一结构：**§X.0 核心特性**（问题 / 不变量 / 误区 / 例子）→ 职责与文件 → Harness 保证 → 实战 → 案例索引（细节在 §21）。
+
 ## 4. L0 引导与入口 Harness
+
+L0 决定 **进程以什么 capability 启动**——feature 集、ablation 基线、是否加载完整 REPL。这一层的问题若错了，后面 L1–L12 全部在错误前提下运行。
+
+### 4.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 这条命令走快速路径还是全量 harness？哪些代码在 build 里被编译期剪掉？ |
+| **关键不变量** | `feature('X')` 仅在 `if`/三元中（Bun DCE）；ablation env 在 `cli.tsx` **任何工具 import 之前**；新子命令默认走快速路径 unless 需要 REPL |
+| **常见误区** | 只在 `dev.ts` 开 feature、未改 `build.ts` → 生产无功能；把 ablation 写进 `init.ts` → 工具常量已 capture |
+| **例子** | 对照 `bun run dev` 与 `node dist/cli.js`：同一 flag，dev 有、`dist` 无 → L0-1 |
 
 ### 4.1 职责
 
@@ -231,6 +296,17 @@ sequenceDiagram
 
 ## 5. L1 会话状态 Harness
 
+L1 是 **进程级身份与坐标系**：sessionId、CWD、projectRoot 决定 transcript、memdir、plans、权限 working dir 写到哪里。**Harness 路径都挂 L1 单例，不能在各层另起一套。**
+
+### 5.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 这次会话的 ID 是什么？文件副作用相对哪条路径？resume 后状态从哪恢复？ |
+| **关键不变量** | `getSessionId()` 进程内稳定；`getProjectDir(getCwd())` 编码 canonical 项目路径；**改 CWD → 必须同步** `additionalWorkingDirectories` |
+| **常见误区** | 在组件 state 缓存 project 路径，与 `bootstrap/state.ts` 漂移；单测不 mock L1 → 并行污染 |
+| **例子** | monorepo 里 `cd packages/foo` 后 Write 被拒 → CWD 变、working dir 未扩（L1-2） |
+
 ### 5.1 职责
 
 - 全局单例：`sessionId`、`cwd`、`projectRoot`、model override
@@ -273,6 +349,19 @@ sequenceDiagram
 ---
 
 ## 6. L2 输入摄取 Harness
+
+L2 保证 **用户表达如何变成一次（且仅一次）可执行的 query 请求**——含排队、Hook 拦截、slash 分流、可中断工具的 abort 语义。
+
+### 6.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 这条输入现在能进模型吗？被 Hook 挡了还是入队了？slash 会不会触发 API？ |
+| **关键不变量** | `QueryGuard`：同时 **1** 个 in-flight query；连发 → `messageQueueManager` → turn 结束 `dequeue`；untrusted workspace **不跑** Hook |
+| **常见误区** | 以为「模型在跑」时任何新输入都会排队——不可 interrupt 的工具在跑时会阻塞或需 abort 分支 |
+| **例子** | 工具循环中用户 steering「先写测试」：若未 abort，需等当前 turn 结束才 dequeue；P0 意图仍完整进下一条 user 消息（→ §7.8） |
+
+**与 L3 交界：** `processUserInput` 输出 user message + `shouldQuery`；attachments 在 `shouldQuery === true` 时进入 L3。
 
 ### 6.1 职责
 
@@ -331,6 +420,15 @@ PromptInput → handlePromptSubmit → executeUserInput → processUserInput
 L3 负责 **上下文资产管理**：计量窗口占用、组装 API payload、以及在超窗时按 deterministic pipeline 丢弃/摘要——**不是**让模型自己决定删什么。
 
 > **与 L7 的关系：** §7.4 是完整治理 pipeline（含压缩）；§11 展开各 compressor 函数参数与边界条件。改窗口行为时两层同读。
+
+### 7.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 本轮 API 请求里有哪些 bytes？超窗时删谁留谁？compact 后如何补回 plan/文件？ |
+| **关键不变量** | **双视图**：UI/transcript 全保留，API 只看 `messagesForQuery`；六类 bytes（§7.2）分工明确；compact 后 `buildPostCompactMessages` 顺序固定 |
+| **常见误区** | 聊天面板历史 = 模型所见；改 CLAUDE.md 未清 memoize；把 microcompact 当「丢 user 消息」 |
+| **例子** | 用户改口仍做旧任务 → 查 P0 最新 user + summary §8/§9（§7.8、L3-7） |
 
 ### 7.1 双层视图：Transcript vs API-facing
 
@@ -472,7 +570,139 @@ Summary 由 `runForkedAgent` + `getCompactPrompt` 生成；compact 请求 PTL �
 | [L3-1](#案例-l3-1-claudemd-修改不生效) | `postCompactCleanup.ts` |
 | [L3-5](#案例-l3-5-如何读当前-token-占用) | `tokenCountWithEstimation` |
 | [L3-6](#案例-l3-6-compact-后-plan-丢失) | `createPlanAttachmentIfNeeded` |
+| [L3-7](#案例-l3-7-长对话中用户改口模型仍按旧任务做) | `prompt.ts` compact 结构 + boundary slice |
+| [L3-8](#案例-l3-8-几十轮后模型忘了早期约束) | L4 prefetch + post-compact 恢复包 |
 | [L7-1](#案例-l7-1-对话中途突然变摘要) | `shouldAutoCompact` |
+
+### 7.8 长对话：意图识别与关键信息传递
+
+对话超过几十轮后，full transcript 往往进不了 API 窗口。Harness 必须**确定性**回答两件事：
+
+1. **本轮用户真正想做什么**（意图，含改口、 steering、续做旧任务）
+2. **哪些早期信息不能丢**（架构约束、用户否决项、进行中的 plan）
+
+> **常见误区：** 意图识别不是单独的「分类器服务」。本仓库没有 `classifyUserIntent()` 这类入口——意图是 **L2 最新输入 + L3 注入 + L7 摘要结构 + L4 外化** 叠加后，模型在窗口内看到的**信号组合**。改 Harness 时要想的是「哪些信号必须进窗口、以什么优先级」，而不是「让模型自己从历史里猜」。
+
+#### 7.8.1 意图信号：Harness 保证的优先级
+
+| 优先级 | 信号来源 | 层 | 代码 / 机制 | Harness 保证什么 |
+|--------|----------|-----|-------------|------------------|
+| **P0** | 当前 user 消息原文 | L2 | `processUserInput` → 进入 `messages` | 每轮完整保留在 transcript；在 retention 窗口内**原样**进 API slice |
+| **P1** | 对话弧线的显式约束 | L7 | `getCompactPrompt()` 摘要 §1/§6/§8/§9 | 压缩后旧轮次变为 summary user message，但 prompt **强制**列出全部 user 消息、Primary Request、Current Work，且 §9 要求**逐字引用**最近对话 |
+| **P2** | 结构化任务状态 | L3 | `getAttachmentMessages` | plan / plan mode / @文件 / IDE 选区 / invoked skill 等 attachment，每 user turn 刷新 |
+| **P3** | 跨轮偏好与架构 | L4 | memdir prefetch、`MEMORY.md` | 与当前 query 相关的 sidecar（≤5 文件/turn）+ 索引段 |
+| **P4** | 项目静态规则 | L3 | `getUserContext()` → CLAUDE.md | 每 session memoize；compact 后 `runPostCompactCleanup` 刷新 |
+| **P5** | 旧轮 tool 输出细节 | L7 microcompact | 清内容留 stub | **不**承载意图；细节在磁盘文件 / transcript JSONL，需 re-Read 或靠摘要 |
+
+**意图消歧规则（Harness 侧，非模型侧）：**
+
+| 用户行为 | Harness 如何处理 | 模型应看到的「当前意图」 |
+|----------|------------------|------------------------|
+| **续做**（「继续」「接着改」） | 最新消息 + summary §8 Current Work + §9 Optional Next Step | 以 §8/§9 与最近 verbatim 消息为准 |
+| **Steering**（「先别管 UI，只写测试」） | P0 最新消息覆盖同轮任务描述；旧 assistant 计划仍在 history 但优先级低于 P0 | **最新 user 消息** |
+| **改口 / 否决**（「不要用 Redis 了」） | compact prompt 要求 §4 Errors/fixes 与 §6 All user messages 保留否决句；L4 extract 可外化到 memdir | summary 中的 user 消息列表 + 最新句 |
+| **新任务**（与旧 topic 无关） | Harness **不**自动检测 topic shift；靠 P0 + 用户是否 `/clear` | 最新消息；若模型仍纠缠旧 summary → 用户应 `/compact 聚焦在新任务` 或写 CLAUDE.md |
+
+```mermaid
+flowchart LR
+  subgraph p0 ["P0 每轮必达"]
+    U[最新 user 消息]
+  end
+  subgraph p1 ["P1 压缩后仍达"]
+    S[compact summary<br/>§1 §6 §8 §9]
+    R[retention 窗口<br/>最近 5+ 条文本消息]
+  end
+  subgraph p2 ["P2–P4 按需注入"]
+    A[turn attachments]
+    M[memdir prefetch]
+    C[CLAUDE.md]
+  end
+  U --> API[callModel messagesForQuery]
+  S --> API
+  R --> API
+  A --> API
+  M --> API
+  C --> API
+```
+
+#### 7.8.2 几十轮后：关键信息如何送进模型（六通道）
+
+§7.2 的六类 bytes 在长会话中的**分工**如下——不是六选一，而是**同时**作用：
+
+| 通道 | 长对话中保留什么 | 典型触发轮次 | 代码锚点 |
+|------|------------------|--------------|----------|
+| **① 对话 slice** | boundary 后消息；SM compact 至少 5 条文本 + 10k token | 每 iteration | `getMessagesAfterCompactBoundary` |
+| **② Compact 摘要** | 早期全部 user 意图、文件列表、错误、pending tasks | token ≥ autocompact 阈值 | `compactConversation` + `getCompactPrompt` |
+| **③ Post-compact 恢复包** | 最近读过文件、active plan、已用 skill、工具 delta | compact 刚发生 | `buildPostCompactMessages` |
+| **④ Microcompact** | 最近 5 个 tool result 全文；更早的 Read/Bash 变 stub | 工具输出堆积 | `microCompact.ts` `keepRecent: 5` |
+| **⑤ L4 外化** | 偏好/架构写 memdir；session 内写 `session-memory/summary.md` | turn 结束 extract；compact 前 SM | `extractMemories` / `trySessionMemoryCompaction` |
+| **⑥ 静态 context** | CLAUDE.md、git 状态、rules | 每 turn（memoize） | `prependUserContext` |
+
+**Full transcript 与 API slice 的分工：**
+
+- UI / 磁盘 JSONL：**永不因 compact 删除**（用户可 `/resume`、extract 可读全历史）
+- API：**只看 slice + 摘要 + 恢复包**——改 Harness 时用这个视图调试（`/context`）
+
+#### 7.8.3 举例：三条典型长对话路径
+
+##### 示例 A — 45 轮功能开发，第 38 轮用户 steering
+
+**时间线（简化）：**
+
+| 轮次 | 用户说了什么 | Harness 动作 | 进 API 的关键 bytes |
+|------|--------------|--------------|---------------------|
+| 1–5 | 「给 checkout 加 OAuth，**禁止**引入新 npm 包」 | 正常累积 messages | 全文 history |
+| 6–30 | 大量 Read/Edit/Bash | microcompact 清旧 Read 内容 | 最近 5 个 tool + 文件在磁盘 |
+| 31 | token 接近阈值 | `trySessionMemoryCompaction` 或 full autocompact | boundary + **summary**（含 §6 列出 turn 1 的「禁止新包」） |
+| 38 | 「**先别管 UI**，把 OAuth callback 测试写完」 | 无特殊分支；P0 最新消息入 slice | summary §1/§6/§8 + **turn 38 原文** + plan attachment |
+| 39 | 模型若仍改 UI 文件 | — | 说明 §8/§9 或 P0 权重不足；用户可再 steering 或 `/compact 当前任务：只写 OAuth 测试` |
+
+**要点：** Harness 不会在 turn 38 自动删除 turn 1–37 的 UI 相关 history，但 **P0 最新句** + summary **§9 逐字引用** 应让模型转向测试；若失败，是摘要质量或 prompt 遵循问题，不是 queue 丢消息。
+
+##### 示例 B — 60 轮排错，早期错误栈已被 microcompact
+
+**现象：** turn 12 的 `TypeError: x is undefined` 全文已被 microcompact 清掉，turn 55 用户问「最初那个报错怎么修的？」
+
+**Harness 实际发给模型的内容：**
+
+```
+[compact summary user message]
+  §4 Errors and fixes: … turn 12 TypeError in auth.ts:42，fix: null check …
+[recent messages verbatim]
+  turn 53–60 …
+[microcompact stub]
+  "[Old tool result content cleared]"  ← turn 12 的 Bash 原文不在
+[post-compact file attachment]
+  auth.ts 最近快照（若在 readFileState 内）
+```
+
+**恢复路径（产品层，Harness 已留钩子）：**
+
+1. summary §4 若写全 → 模型直接答
+2. 否则 `getCompactUserSummaryMessage` 提示 transcript 路径 → 模型 **Read** JSONL
+3. 改 Harness：提高 SM compact 的 `minTextBlockMessages`，或 `/compact 保留所有 error message 原文`
+
+##### 示例 C — 跨会话：第 1 天 80 轮，第 2 天 resume
+
+| 阶段 | 机制 | 效果 |
+|------|------|------|
+| 第 1 天 turn 结束 | `extractMemories` → `memory/auth-prefs.md` | 外化「只用 Postgres」 |
+| 第 1 天 compact | `session-memory/summary.md` | 会话内摘要 |
+| 第 2 天 `/resume` | full transcript 从磁盘加载 | UI 全历史 |
+| 第 2 天首条 user | `loadMemoryPrompt` + **prefetch** | 相关 mem 注入 `<system-reminder>` |
+| API slice | 新 session 边界 + 摘要 + prefetch | 无需重放 80 轮全文 |
+
+#### 7.8.4 改 Harness / 调摘要时的检查清单
+
+| 你要保证的性质 | 改哪里 | 回归看什么 |
+|----------------|--------|------------|
+| 最新 user 意图不丢 | boundary retention、`calculateMessagesToKeepIndex` | L3-7：steering 后行为 |
+| 早期否决/约束不丢 | `getCompactPrompt` §6/§4 文案；`/compact` 自定义指令 | L3-8 |
+| 任务状态不丢 | `createPlanAttachmentIfNeeded`、plan mode attachment | L3-6 |
+| 文件细节可恢复 | `createPostCompactFileAttachments` 上限 | L7-5 |
+| 跨 session 偏好 | L4 extract + prefetch gate | L4-1、L4-3 |
+
+**调试命令：** `/context` 看 API-facing slice；`DEBUG=1` 搜 `autocompact:`；compact 后断点 `buildPostCompactMessages`。
 
 ---
 
@@ -485,6 +715,17 @@ L4 是 **跨会话 + 会话内** 的知识外化层，与 L3 窗口治理分工�
 | 单 session 内 token 超限 | L3/L7 compact、session-memory |
 | 跨 session 记住偏好/架构 | L4 memdir |
 | 本轮可能需要某条 memory | L4 prefetch |
+
+### 8.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 什么该记住到磁盘？什么该在本轮注入窗口？session 内 vs 跨 session 如何分工？ |
+| **关键不变量** | **四条路径勿混**（§8.1）；MEMORY.md 只做索引（有截断）；prefetch 有 gate（多词 prompt、60KB session cap、≤5 文件）；extract **异步**于 turn 结束 |
+| **常见误区** | 把 extract 当同步——headless exit 早于 drain 则丢；单词 prompt 期望 prefetch；主 agent 已写 memory 仍重复 extract |
+| **例子** | 第 1 天 80 轮写入「只用 Postgres」→ extract 到 sidecar → 第 2 天 resume 后 prefetch 拉回（§7.8 示例 C） |
+
+**与 L3 分工：** L3 管窗口内 bytes；L4 管**窗口装不下或跨 session** 的知识——先外化再按需拉回。
 
 ### 8.1 四条路径（勿混）
 
@@ -581,6 +822,17 @@ Headless：`print.ts` → `drainPendingExtraction()` 再 shutdown。
 
 ## 9. L5 调度与 Autonomy Harness
 
+L5 是 **Harness 自己的调度器**：cron、HEARTBEAT、managed flow 把 prompt 变成带 `runId` 的 `QueuedCommand`——**从不**把「下一轮何时跑」交给模型决定。
+
+### 9.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 后台 tick 何时进模型？run 何时从 queued→running→completed？后台 slash 何时算结束？ |
+| **关键不变量** | **双 finalize 路径**语义一致（§9.3）；stale/cancelled run **不得** claim；`deferAutonomyCompletion` → 跳过即时 finalize |
+| **常见误区** | 只在 `handlePromptSubmit` finalize、忘了 `query.ts` mid-turn drain；KAIROS 未 defer → 叠 worker |
+| **例子** | turn 中途模型收到 HEARTBEAT attachment → `claimConsumableQueuedAutonomyCommands`（L5-3） |
+
 ### 9.1 职责
 
 Managed flow / HEARTBEAT / cron / proactive 将 prompt **入队**为带 `autonomy.runId` 的 `QueuedCommand`，由 harness 消费——**不由模型自行调度**。
@@ -627,6 +879,19 @@ KAIROS 等 slash **detach 后台**但立刻返回 → slash 返回 `{ deferAuton
 
 ## 10. L6 推理循环 Harness（Query / API）
 
+L6 是 **一次 user turn 的编排中枢**：在 L7 预处理与 L8 工具执行之间循环 callModel，直到终止条件或 stopHook 续跑。
+
+### 10.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 一次 Enter 内 API 调几次？压缩何时插入？trace/内存何时释放？ |
+| **关键不变量** | **每 iteration** 入口 `getMessagesAfterCompactBoundary` + L7 pipeline；`claude.ts` 只管**单次** API；`query()` **finally** 必 autonomy finalize + Langfuse flush + Performance clear |
+| **常见误区** | 在 `claude.ts` 加 tool loop 或 compact；prefetch 未 `using` dispose；子进程 dev 断点打不中 `query.ts` |
+| **例子** | 同一 turn 内 Read 大文件 20 次 → 每次 iteration 可能 microcompact → 仍可能 autocompact（L6-3 RSS 若未删 stale payload） |
+
+**模块边界：** 改「循环几次、何时停」→ `query.ts`；改「单次请求参数/流式」→ `claude.ts`；改 REPL turn  bookkeeping → `QueryEngine.ts`。
+
 ### 10.1 职责
 
 - `query()` 包装 trace 生命周期、autonomy finalize、`finally` 清理
@@ -670,7 +935,18 @@ F5 断点：`query.ts` 的 `queryLoop`；API 单次请求断 `claude.ts` 的 `qu
 
 ## 11. L7 上下文窗口 Harness（压缩）
 
-§7.4 的 pipeline 实现层。改 compressor 时对照本表 + `query.ts` 调用顺序。
+§7.4 的 pipeline **实现层**。L7 回答：**token 预算不够时，按什么顺序、丢什么、留什么、如何补回**——全部由函数调用顺序保证，非模型自选。
+
+### 11.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 何时 snip / microcompact / autocompact？各阶段输入输出是什么？失败如何熔断？ |
+| **关键不变量** | `query.ts` 522–650 **顺序不可乱**；`snipTokensFreed` 必须传入 `shouldAutoCompact`；SM compact **优先于** full compact；主线程 compact 才清 `getUserContext.cache` |
+| **常见误区** | 只改阈值不改 pipeline 顺序；subagent compact 误清 parent CLAUDE.md cache；以为 microcompact 删消息（只清 tool **内容**） |
+| **例子** | token 达阈值 → 用户看到对话「突然变摘要」→ boundary + summary + post-compact 恢复包（L7-1） |
+
+**三层递进 severity：** microcompact（局部清 tool 输出）→ session-memory compact（prune + 磁盘 summary）→ full autocompact（fork 摘要模型）。
 
 ### 11.1 阈值公式（必读）
 
@@ -728,6 +1004,19 @@ Telemetry：`tengu_auto_compact_succeeded`、`tengu_compact`（含 `truePostComp
 ---
 
 ## 12. L8 工具与权限 Harness
+
+L8 是 **模型提议与真实副作用之间的唯一闸门**：注册哪些工具、是否 allow/deny/ask、Hook 能否改 input、子 agent 禁哪些工具——全部 deterministic。
+
+### 12.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 这条 `tool_use` 会不会真的执行？规则从哪来？headless 如何问权限？ |
+| **关键不变量** | 决策顺序固定（§12.4）：**deny 先于 allow**；PreToolUse `updatedInput` 必须合并进 `runToolUse`；`destination: session` = 进程 lifetime |
+| **常见误区** | 用户临时批准 = 永久 settings；Auto 模式永不弹窗（`DENIAL_LIMITS` 会 fallback 人工） |
+| **例子** | settings 写了 `deny Bash(rm:*)` 后，即使用户 session-allow 过类似命令仍 deny（L8-1） |
+
+**三层：** 工具 `call()`（packages）→ 注册/执行编排（`tools.ts`）→ 权限管道（`permissions/*`）。改安全策略只动第三层 unless 工具自带 `checkPermissions`。
 
 ### 12.1 三层分工
 
@@ -806,6 +1095,17 @@ tool_use 完成 → StreamingToolExecutor
 
 ## 13. L9 子 Agent Harness
 
+L9 在 **隔离的 query 子循环** 中跑 Task/Agent/fork——继承或独立上下文、工具黑名单、sidechain 持久化，且 **不得污染主线程 harness 状态**。
+
+### 13.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 子 agent 看到什么 history？能用哪些工具？compact/trace/extract 归属谁？ |
+| **关键不变量** | `toolUseContext.agentId` 存在 → extractMemories、autoDream、CHICAGO cleanup **跳过**；子 compact **不清** parent `getUserContext.cache`；Langfuse **复用** parent trace |
+| **常见误区** | 新工具默认可用于 subagent（须同步 `ALL_AGENT_DISALLOWED_TOOLS`）；fork 与普通 agent 上下文相同（fork 继承 full history） |
+| **例子** | AgentTool 长任务跑完 memdir 无 extract 并发写 → 正确（L9-2 gate） |
+
 ### 13.1 职责
 
 - `AgentTool` / `runForkedAgent` / `runAgent` 启动隔离 query
@@ -835,6 +1135,17 @@ tool_use 完成 → StreamingToolExecutor
 ---
 
 ## 14. L10 Turn 收尾 Harness
+
+L10 处理 **模型产出 final text（无 pending tool）之后** 的 harness 义务——Stop hook 可续跑、extract 异步落盘、headless 必须 drain。
+
+### 14.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | turn「看起来结束了」还要跑什么？什么可以 block 下一轮 API？pipe 模式为何 memdir 空？ |
+| **关键不变量** | extract 在 **stopHooks**、且 turn 已无 pending tool；poor/bare/agentId gate 跳过昂贵任务；**headless shutdown 前** `drainPendingExtraction` |
+| **常见误区** | 以为 turn 结束 = 进程可立刻 exit；Stop hook block 时用户以为已停（模型会继续 iteration） |
+| **例子** | `echo "remember X" \| bun run dev -p` 后 memdir 无文件 → 未 drain（L10-2 = L4-2） |
 
 ### 14.1 职责
 
@@ -872,6 +1183,17 @@ Headless 脚本过早 exit → 丢 extractMemories；需等 drain。
 
 ## 15. L11 输出与 Side-Channel Harness
 
+L11 分离 **给人看的输出** 与 **给模型看的 messages**——hint、structuredIO control、Ink UI 条默认不在 model-visible 路径。
+
+### 15.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | Bash 里的 install 提示模型知道吗？headless 权限问答走哪条协议？ |
+| **关键不变量** | Side-channel **默认不进** API messages；若需模型知道 → 显式 attachment 或 user 消息 |
+| **常见误区** | UI 底部 plugin 提示 = 模型已被告知（设计如此，L11-3） |
+| **例子** | Bash 输出含 `<claude-code-hint />` → strip 后进 tool_result → 模型不应复述 install 命令（L11-1） |
+
 ### 15.1 职责
 
 - **Claude Code Hints**：Bash 输出中 `<claude-code-hint />` 被 harness **剥掉**再给模型；UI 可展示 install 提示（`claudeCodeHints.ts`）
@@ -895,6 +1217,17 @@ Side-channel 内容**不得**进入 model-visible messages，除非显式 attach
 ---
 
 ## 16. L12 可观测性 Harness
+
+L12 提供 **可复现的观测与 profiling**，且 **不改变** L2–L11 语义——trace/checkpoint/analytics 是旁路，不是第二套业务逻辑。
+
+### 16.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 这次 query 慢在哪一段？trace 为何一直 running？eval 分组如何固定？ |
+| **关键不变量** | `ownsTrace` 才 `endTrace`；cleanup 在 `query()` **finally**；eval 用 GrowthBook env override |
+| **常见误区** | 为 debug 在 hot path 加同步 IO 却不看 checkpoint；子 agent 误 end parent trace |
+| **例子** | P99 latency 升 → 对比 `query_snip_start` vs `query_api_start` checkpoint（L12-2） |
 
 ### 16.1 职责
 
@@ -926,7 +1259,18 @@ Side-channel 内容**不得**进入 model-visible messages，除非显式 attach
 
 ## 17. 配置型 Harness：Settings 与 Hooks
 
-用户通过 settings **无需改 TS** 扩展 harness：
+用户通过 settings **无需改 TS** 扩展 harness——把「每当 X 就 Y」从代码挪到配置，但 **执行仍走 L2/L8/L10 的 Hook 引擎**，不是模型 memory。
+
+### 17.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 用户如何无代码扩展行为？Hook 在哪些层拦截？何时根本不跑 Hook？ |
+| **关键不变量** | untrusted workspace → **skip** hooks（防 RCE）；`CLAUDE_CODE_SIMPLE=1` → 关 Hook；PreToolUse 可 block/改 input，UserPromptSubmit 可 block query |
+| **常见误区** | 用 memory 文件代替 Stop hook 跑脚本；clone 陌生 repo 配了 hook 却不执行（未 trust） |
+| **例子** | 「每次 git push 前跑 review 脚本」→ settings `PreToolUse` matcher `Bash`，不是 CLAUDE.md 里写「记得跑脚本」 |
+
+**可配置项一览：**
 
 | 配置 | 作用层 |
 |------|--------|
@@ -955,6 +1299,19 @@ Hook 引擎：`executeHooks`（`src/utils/hooks.ts`）；schema：`src/entrypoin
 
 ## 18. 关键契约（改之前必读）
 
+§18 是 **跨层 invariant 的索引**——改 L2/L5/L6 时若违反下列契约，单测可能仍过但集成/生产会出现 stuck、叠 worker、cache 污染。
+
+### 18.0 契约速览
+
+| 契约 | 违反症状 | 涉及层 |
+|------|----------|--------|
+| Deferred autonomy completion | KAIROS 叠 worker、run 提前 completed | L5、L2 |
+| Mid-turn queue drain ↔ turn 结束 finalize 一致 | run 永久 queued、重复 tick | L5、L6 |
+| 主线程 vs 子 agent compact cleanup | parent CLAUDE.md stale 或误刷新 | L3、L9 |
+| Headless 对称 REPL | pipe 与 TUI 行为分叉 | L2、L3、L10 |
+| Ablation env 早于工具 import | 实验对照组无效 | L0 |
+| TEST-ONLY `allowBackgroundForkedSlashCommands` | 勿当生产 API | L9、§19 |
+
 ### 18.1 Deferred autonomy completion
 
 ```ts
@@ -979,6 +1336,17 @@ env 注入在 `cli.tsx` import 前，不在 `init.ts`。
 ---
 
 ## 19. 测试 Harness
+
+测试验证的是 **Harness 确定性**，不是模型输出质量。分层：**单测** mock L1、测 gate 逻辑；**集成测** 用 `dist/cli.js` 子进程测真实 CLI 链。
+
+### 19.0 核心特性
+
+| 维度 | 内容 |
+|------|------|
+| **回答的问题** | 测哪一层、mock 什么、为何不 mock 被测模块上层？ |
+| **关键不变量** | `mock.module` 进程全局污染 → 用 `tests/mocks/` 链；autonomy deferred 测需 `NODE_ENV=test` + test escape hatch；集成测 **必须** `dist/cli.js` |
+| **常见误区** | 单测过 = 可发布；`bun run dev` 路径当集成测入口；mock 了 `query.ts` 却声称测了 handlePromptSubmit |
+| **例子** | `autonomy-lifecycle-user-flow.test.ts` + `CLAUDE_CONFIG_DIR` temp → 测 L5 全链路 |
 
 ### 19.1 单元测试（in-process）
 
@@ -1017,6 +1385,26 @@ bun run precheck
 ---
 
 ## 20. 调试与排错索引
+
+排错心法：**先定层（L0–L12）→ 再定段（§2.1 五段式）→ 用该层 invariant 对照现象**。勿从模型回复反推 harness bug。
+
+### 20.0 症状 → 层 → 第一步
+
+| 用户/测试现象 | 优先层 | 第一步 |
+|---------------|--------|--------|
+| 功能 dev 有、build 无 | L0 | 对比 `dev.ts` / `build.ts` feature 列表 |
+| resume 路径错 / Write working dir | L1 | 打印 `getCwd`、`getProjectDir`、`sessionId` |
+| 消息丢 / 不排队 / slash 无 API | L2 | `QueryGuard`、`getCommandQueue()` |
+| 模型「忘了」/ CLAUDE.md stale / token | L3、L7 | `/context`、`autocompact:` 日志 |
+| memdir 空 / prefetch 无 | L4、L10 | `stopHooks` gate、`drainPendingExtraction` |
+| autonomy stuck / 叠 tick | L5 | finalize 双路径、`deferredAutonomyRunIds` |
+| tool loop 不停 / RSS 涨 | L6 | `maxTurns`、stale `toolUseResult`、`query()` finally |
+| 中途变摘要 | L7 | `shouldAutoCompact`、post-compact attachments |
+| 工具 deny / hook 未改 input | L8 | §12.4 顺序、PreToolUse 合并 |
+| 子 agent 调禁工具 / extract 乱跑 | L9 | `agentId` gate、工具黑名单 |
+| pipe 记忆未写入 | L10 | shutdown vs drain 顺序 |
+| UI 有 hint 模型不知 | L11 | 设计预期 vs strip bug |
+| trace running / 变慢 | L12 | `ownsTrace`、checkpoint 对比 |
 
 | 目标 | 层 | 做法 |
 |------|-----|------|
@@ -1243,6 +1631,46 @@ if (planAttachment) postCompactFileAttachments.push(planAttachment)
 3. 若缺失：查 `createPlanAttachmentIfNeeded` 返回 null 的条件（无 active plan / agentId 路径）
 
 **修复方向：** 确保 plan 持久化在 harness 路径（`plans/`），而非只存在于被摘要掉的 messages 里。
+
+---
+
+#### 案例 L3-7：长对话中用户改口，模型仍按旧任务做
+
+**现象：** 第 30+ 轮用户说「先写测试别管 UI」，模型继续改 React 组件。
+
+**根因链（按优先级排查）：**
+
+1. **P0 是否进 slice？** `/context` 确认最新 user 消息在 `messagesForQuery` 末尾，未被 queue 吞掉（→ L2-1）
+2. **Summary 是否覆盖 P0？** compact 后看 summary user message 的 §8 Current Work / §9 Optional Next Step 是否仍描述 UI 任务——若 §9 未逐字引用 turn 38，改 `getCompactPrompt`（`prompt.ts:61-77`）或用户 `/compact 以最新消息为准，Current Work 只描述 OAuth 测试`
+3. **Plan attachment 是否锁死旧方向？** 断点 `createPlanAttachmentIfNeeded`——active plan 文件若仍写 UI，模型会倾向旧 plan（→ L3-6：更新 plan 或 ExitPlanMode 后重写）
+
+**Harness 不会做的事：** 自动检测「改口 = 新意图」并删除旧 history——这是刻意的；steering 靠 **P0 + 摘要结构** 表达优先级。
+
+**验证：** steering 后发一条可观测指令（如「只改 `*.test.ts`」），assert 首个 Write/Edit 路径匹配；`/context` 中最新消息在 summary 之后、plan attachment 与 P0 一致。
+
+---
+
+#### 案例 L3-8：几十轮后模型「忘了」早期约束
+
+**现象：** turn 3 用户说「不要加新依赖」，turn 50 模型提议 `npm install lodash`。
+
+**信息本应存在于：**
+
+| 通道 | 检查 |
+|------|------|
+| Compact §6 All user messages | `/context` 中 summary 是否列出 turn 3 原句 |
+| CLAUDE.md | 是否应把「禁止新依赖」写成项目规则（P4，每 turn 注入） |
+| L4 memdir | `extractMemories` 是否写入；下轮 prefetch 是否 gate 掉（单词 prompt、60KB cap → L4-3） |
+| Microcompact | 约束在 user 消息不在 tool result——不应被 MC 清掉 |
+
+**操作步骤：**
+
+1. 读 compact 后 API slice：`getMessagesAfterCompactBoundary` + summary 块
+2. 若 §6 缺失约束 → 调 `BASE_COMPACT_PROMPT` 或 `/compact 必须保留所有用户否决项和禁止项，原文列出`
+3. 若跨 session 丢失 → 写 `memory/constraints.md`，下轮用多词 prompt 触发 prefetch
+4. 长期约束应进 **CLAUDE.md**（Harness 保证每 turn 在 `<project-instructions>`）
+
+**改代码方向：** 提高 `calculateMessagesToKeepIndex` 的 `minTextBlockMessages` 只能缓解「最近对话」；**早期约束**必须靠 summary §6 或 L4/CLAUDE.md 外化。
 
 ---
 
@@ -1755,6 +2183,7 @@ if (sessionMemoryResult) {
 | F | 队列优先级错 | L2/L5 | [L2-1](#案例-l2-1-连发三条消息只执行了第一条)、[L5-3](#案例-l5-3-turn-中途插队的高优先级-autonomy-命令) |
 | G | 工具 deny | L8 | [L8-1](#案例-l8-1-bash-明明批准过仍被-deny)～[L8-5](#案例-l8-5-auto-模式连续-deny-后突然要人工确认) |
 | J | CLAUDE.md stale / token 占用 | L3 | [L3-1](#案例-l3-1-claudemd-修改不生效)、[L3-5](#案例-l3-5-如何读当前-token-占用) |
+| O | 长对话意图/改口/早期约束丢失 | L3/L4/L7 | [L3-7](#案例-l3-7-长对话中用户改口模型仍按旧任务做)、[L3-8](#案例-l3-8-几十轮后模型忘了早期约束)、[§7.8](#78-长对话意图识别与关键信息传递) |
 | H | 突然 autocompact / 压缩行为 | L7 | [L7-1](#案例-l7-1-对话中途突然变摘要)～[L7-5](#案例-l7-5-microcompact-清掉了仍需的-read-内容) |
 | I | Memory 未写入 / prefetch | L4 | [L4-1](#案例-l4-1-长对话后-memdir-无新文件)～[L4-5](#案例-l4-5-主-agent-写了-memory-extract-仍重复写) |
 | K | 子 agent 异常 | L9 | [L9-1](#案例-l9-1-子-agent-调用了禁止的工具)～[L9-3](#案例-l9-3-子-agent-resume-后上下文丢失) |
@@ -1771,7 +2200,7 @@ if (sessionMemoryResult) {
 | L0 入口 | dev + build feature 集；cli 快速路径 | L0-1 |
 | L1 状态 | CWD / projectDir / sessionId | L1-1、L1-2 |
 | L2 排队 | REPL + `print.ts` + QueryGuard | L2-1、L2-3 |
-| L3 context | memoize invalidation；headless 传参 | L3-1、L3-2 |
+| L3 context | memoize invalidation；headless 传参；compact 摘要 §6/§9 | L3-1、L3-2、L3-7、L3-8 |
 | L4 memory | feature + poor + bare；filesystem paths | L4-1、L4-2 |
 | L5 autonomy | 双 finalize；deferred completion | L5-1、L5-2 |
 | L6 query | `finally` autonomy + Langfuse flush | L6-1、L6-3 |
@@ -1797,4 +2226,4 @@ if (sessionMemoryResult) {
 
 ---
 
-**维护：** 每层 §4–§17 的「典型案例」必须与 **§21 五段式 + 代码路径** 同步。L3/L7 改动压缩 pipeline 时，务必更新 §7.4 顺序表与 §11.2 函数表。
+**维护：** 每层 §4–§17 的「典型案例」必须与 **§21 五段式 + 代码路径** 同步。L3/L7 改动压缩 pipeline 时，务必更新 §7.4 顺序表与 §11.2 函数表。各层 **§X.0 核心特性** 与 §1.4 速览表保持一致。
